@@ -1,0 +1,84 @@
+# nfpm config for a COSMIC (libcosmic) app or applet — the COSMIC-flavored
+# variant of templates/nfpm.yaml; same RK_* variables, same three packagers
+# (deb, rpm, arch). What differs from the generic template is convention,
+# not machinery:
+#   - everything user-visible is named by the reverse-DNS APPID
+#     (io.github.you.myapp), including the .desktop file, because COSMIC
+#     matches windows to desktop entries by app id
+#   - icons are scalable SVGs in the hicolor tree (res/icons/hicolor/...),
+#     not a single PNG — the AppImage still needs one PNG (icon input)
+#   - i18n needs nothing here: libcosmic apps embed their Fluent
+#     translations in the binary (i18n-embed)
+#
+# The cosmic-utils justfile's `just install` maps 1:1 onto the contents:
+# below. The BUILD stays the kit's default cargo command — do NOT point
+# build_command at `just install` (it writes to /usr, not to a package root).
+# A workspace app (crates/) keeps the same defaults; cargo puts the binary
+# at target/$RK_TARGET/release/$RK_BINARY regardless.
+
+name: myapp
+arch: ${RK_DEB_ARCH}
+platform: linux
+version: ${RK_VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Your Name <you@example.com>
+vendor: Your Org
+homepage: https://example.com
+license: GPL-3.0-only
+description: |
+  One paragraph shown by apt/dnf/pacman. The first line is the short
+  description; keep it under 80 characters.
+
+# A wgpu-backed libcosmic app links surprisingly little — check with
+# `ldd target/<triple>/release/myapp` and translate to each distro's names.
+overrides:
+  deb:
+    depends:
+      - libxkbcommon0
+  rpm:
+    depends:
+      - libxkbcommon
+  # Arch names — validated for real by arch-repo.yml's install test.
+  archlinux:
+    depends:
+      - libxkbcommon
+
+contents:
+  - src: ${RK_BINARY_PATH}
+    dst: /usr/bin/myapp
+    file_info:
+      mode: 0755
+
+  # COSMIC finds the entry by APPID; an applet is the same file plus
+  #   X-CosmicApplet=true
+  #   NoDisplay=true            (panel item, not a launcher entry)
+  # in the .desktop itself.
+  - src: res/io.github.you.myapp.desktop
+    dst: /usr/share/applications/io.github.you.myapp.desktop
+
+  # The full hicolor SVG tree, as `just install` lays it out.
+  - src: res/icons/
+    dst: /usr/share/icons/hicolor/
+    type: tree
+
+  # AppStream MetaInfo: what COSMIC Store / GNOME Software show. Required
+  # for Flathub anyway, so ship it in the native packages too.
+  - src: res/io.github.you.myapp.metainfo.xml
+    dst: /usr/share/metainfo/io.github.you.myapp.metainfo.xml
+
+  - src: LICENSE
+    dst: /usr/share/doc/myapp/copyright
+    type: doc
+
+# No maintainer scripts: pacman's alpm hooks and Fedora's file triggers
+# refresh icon/desktop caches on their own, and the kit's AUR .install
+# covers the .deb repack.
+
+deb:
+  fields:
+    Bugs: https://github.com/my-org/myapp/issues
+
+rpm:
+  summary: One-line summary for the RPM header

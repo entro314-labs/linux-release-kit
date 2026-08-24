@@ -57,9 +57,12 @@ jobs:
       # desktop_file: 'packaging/linux/myapp.desktop'
       # icon: 'packaging/linux/myapp.png'
       # metainfo: 'packaging/linux/com.example.MyApp.metainfo.xml'
-      # --- Shipped platform set + formats (optional; defaults shown)
+      # --- Shipped platform set + formats. `arch` adds a native pacman
+      #     .pkg.tar.zst — required by the arch-repo job below and directly
+      #     installable with `pacman -U <release-url>`; drop it if you delete
+      #     that job. (Workflow default: 'deb,rpm,appimage'.)
+      formats: 'deb,rpm,appimage,arch'
       # targets: 'linux-x86_64,linux-aarch64'
-      # formats: 'deb,rpm,appimage'
       # --- glibc baseline (optional). ubuntu-22.04 = glibc 2.35. Raise it
       #     deliberately; never point these at ubuntu-latest.
       # runner_x86_64: 'ubuntu-22.04'
@@ -90,6 +93,27 @@ jobs:
       # sdk: 'org.gnome.Sdk'
       # runtime_version: '48'
       # tray_icon: true                # ← only if the app has a tray icon
+    secrets: inherit
+
+  # --- OPTIONAL: self-hosted pacman repository. Publishes the released
+  #     .pkg.tar.zst (formats must include 'arch') into a shared, GitHub
+  #     Pages-served pacman repo — the Arch channel that works even while the
+  #     AUR is not accepting submissions. One-time hosting-repo setup is in
+  #     the arch-repo.yml header; needs the ARCH_REPO_TOKEN secret, without
+  #     which the repo is still staged and validated, just not pushed.
+  #     DELETE this job if you don't ship a pacman repo.
+  arch-repo:
+    needs: release
+    uses: entro314-labs/linux-release-kit/.github/workflows/arch-repo.yml@main
+    with:
+      tag: ${{ inputs.tag || '' }}
+      releases_repo: 'my-org/myapp-releases'
+      product_name: 'myapp'
+      repo_name: 'myrepo'              # ← the [section] users add to pacman.conf; shared by all your apps
+      pages_repo: 'my-org/arch-repo'   # ← public repo with GitHub Pages on pages_branch
+      # pages_branch: 'main'
+      # keep: '2'                      # ← superseded versions kept for rollback
+      # dry_run: true                  # ← stage + validate without pushing
     secrets: inherit
 
   # --- OPTIONAL: Arch User Repository. Publishes a `-bin` package built from

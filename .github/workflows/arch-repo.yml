@@ -1,0 +1,453 @@
+# Reusable pacman-repository workflow: publishes the released Arch
+# .pkg.tar.zst files into a self-hosted pacman repository served by GitHub
+# Pages. Users add three lines to /etc/pacman.conf once and from then on
+# install and upgrade the app with plain `pacman -Syu` — no AUR account, no
+# AUR helper, no flatpak/AppImage. This is the Arch channel that keeps
+# working when the AUR is not accepting submissions; aur.yml remains the
+# AUR's own listing for when it is.
+#
+# WHY A GIT REPO ON PAGES: pacman only needs static files over HTTPS — the
+# packages, their detached .sig files, and a repo database written by
+# repo-add. A plain git repo with Pages enabled serves exactly that, one
+# shared repository can host every app (each release run adds its own
+# package and leaves the others alone), and the git history doubles as the
+# repo's audit log.
+#
+# Run it AFTER release.yml has published the release (`needs: release` in
+# the caller): it downloads the published .pkg.tar.zst assets, verifies them
+# against the release's SHA256SUMS, and repacks NOTHING — the bytes users
+# get from pacman are the bytes on the GitHub release.
+#
+# ONE-TIME SETUP for the hosting repo (shared across all your apps):
+#   1. Create a PUBLIC repo (e.g. my-org/arch-repo) with any initial commit.
+#   2. Settings → Pages → deploy from branch, the branch named by
+#      `pages_branch`, root folder.
+#   3. Create a fine-grained PAT with Contents:RW on that repo and add it to
+#      each app repo as the ARCH_REPO_TOKEN secret.
+# Users then configure, once:
+#      [<repo_name>]
+#      SigLevel = Optional TrustAll        # see docs/SIGNING.md for Required
+#      Server = https://<owner>.github.io/<repo>/$arch
+#
+# GRACEFUL DEGRADATION: no ARCH_REPO_TOKEN, or `dry_run: true`, still stages
+# the repository, runs repo-add and validates a real `pacman -S` install in
+# an Arch container, then uploads the staged tree as an artifact instead of
+# pushing. A half-configured channel (token present but the clone fails)
+# fails loudly.
+#
+# CONCURRENT RELEASES: two apps releasing at once race on the shared hosting
+# repo. A rejected push triggers a full re-stage from the updated remote —
+# repo-add is re-run against the other app's fresh database — rather than a
+# rebase, which would silently drop one app's database entry.
+
+name: Pacman repo (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      product_name:
+        description: 'The .pkg.tar.zst filename stem (release.yml product_name)'
+        required: true
+        type: string
+      repo_name:
+        description: >-
+          Pacman repository name: the [section] users put in pacman.conf and
+          the database filename (<repo_name>.db). One name shared by every
+          app publishing into the same hosting repo. Lowercase, no spaces.
+        required: true
+        type: string
+      pages_repo:
+        description: >-
+          'owner/name' of the PUBLIC git repository that hosts the pacman
+          repository (GitHub Pages enabled on pages_branch). Shared across
+          apps — see the one-time setup note in the header.
+        required: true
+        type: string
+      pages_branch:
+        description: 'Branch of pages_repo that GitHub Pages serves.'
+        required: false
+        type: string
+        default: 'main'
+      tag:
+        description: 'Release tag to publish (vX.Y.Z). Defaults to the pushed tag ref.'
+        required: false
+        type: string
+        default: ''
+      releases_repo:
+        description: "'owner/name' hosting the release assets. Empty = this repo."
+        required: false
+        type: string
+        default: ''
+      arches:
+        description: >-
+          Comma-separated architectures (subset of: x86_64, aarch64). Each
+          needs a matching .pkg.tar.zst on the release; a missing one is
+          dropped with a warning rather than failing the channel.
+        required: false
+        type: string
+        default: 'x86_64,aarch64'
+      keep:
+        description: >-
+          How many SUPERSEDED versions of this package to keep per
+          architecture for rollback, besides the one being published. Older
+          files (and their .sig) are pruned; the database only ever points at
+          the newest, so pruning never breaks an install.
+        required: false
+        type: string
+        default: '2'
+      dry_run:
+        description: 'Stage and validate the repository but do not push to pages_repo'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      ARCH_REPO_TOKEN:
+        description: >-
+          Fine-grained PAT with Contents:RW on pages_repo. Absent =
+          stage-and-validate only, with a warning.
+        required: false
+      RELEASES_TOKEN:
+        description: 'Fine-grained PAT with Contents:Read on releases_repo, when that repo is private'
+        required: false
+      LINUX_GPG_PRIVATE_KEY:
+        description: >-
+          Same key release.yml signs with. Signs the repo database, verifies
+          the packages' .sig files, and publishes the public key at the repo
+          root. Unset = an unsigned repository (SigLevel Optional TrustAll).
+        required: false
+      LINUX_GPG_PASSPHRASE:
+        description: 'Passphrase for LINUX_GPG_PRIVATE_KEY, when the key has one.'
+        required: false
+      LINUX_GPG_KEY_ID:
+        description: 'Key ID/fingerprint to sign with. Defaults to the first secret key in the imported keyring.'
+        required: false
+
+jobs:
+  pacman-repo:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve release
+        id: rel
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASES_REPO: ${{ inputs.releases_repo }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          KEEP: ${{ inputs.keep }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::'$TAG' is not a semver release tag — pass the tag input explicitly when not running on a tag push"
+            exit 1
+          fi
+          printf '%s' "$REPO_NAME" | grep -Eq '^[a-z0-9][a-z0-9._-]*$' \
+            || { echo "::error::repo_name '$REPO_NAME' is not a valid pacman repository name (lowercase, no spaces)"; exit 1; }
+          printf '%s' "$KEEP" | grep -Eq '^[0-9]+$' \
+            || { echo "::error::keep must be a non-negative integer, got '$KEEP'"; exit 1; }
+          VERSION="${TAG#v}"
+          # Must match the arch step in release.yml: hyphens DELETED, so a
+          # prerelease sorts before the stable release under vercmp.
+          PKGVER="${VERSION//-/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "pkgver=$PKGVER" >> "$GITHUB_OUTPUT"
+          echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      # The packages are verified against the release's SHA256SUMS before
+      # anything is staged: what enters the pacman repo is provably the
+      # artifact set users can already download by hand.
+      - name: Collect .pkg.tar.zst assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ steps.rel.outputs.repo }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          PKGVER: ${{ steps.rel.outputs.pkgver }}
+          PRODUCT: ${{ inputs.product_name }}
+          ARCHES: ${{ inputs.arches }}
+        run: |
+          set -euo pipefail
+          PKGS="${RUNNER_TEMP}/pkgs"
+          mkdir -p "$PKGS"
+          gh release download "$TAG" --repo "$REPO" --pattern 'SHA256SUMS' --dir "$PKGS" --clobber
+          ARCH_LIST=$(printf '%s' "$ARCHES" | tr -d '[:space:]' | tr ',' ' ')
+          FOUND=""
+          AVAILABLE=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          for ARCH in $ARCH_LIST; do
+            case "$ARCH" in
+              x86_64|aarch64) ;;
+              *) echo "::error::Unsupported architecture '$ARCH' (allowed: x86_64, aarch64)"; exit 1 ;;
+            esac
+            ASSET="${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst"
+            if ! printf '%s\n' "$AVAILABLE" | grep -qx -- "$ASSET"; then
+              echo "::warning::No ${ASSET} on ${REPO}@${TAG} — dropping ${ARCH} from the pacman repo update"
+              continue
+            fi
+            gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir "$PKGS" --clobber
+            # Exact filename match — a substring grep would also pull in the
+            # package's .sig line and fail on the not-yet-downloaded file.
+            ( cd "$PKGS" && awk -v a="$ASSET" '$2 == a' SHA256SUMS | sha256sum -c - ) \
+              || { echo "::error::${ASSET} does not match the release's SHA256SUMS"; exit 1; }
+            # The detached signature release.yml uploaded, when signing is on.
+            if printf '%s\n' "$AVAILABLE" | grep -qx -- "${ASSET}.sig"; then
+              gh release download "$TAG" --repo "$REPO" --pattern "${ASSET}.sig" --dir "$PKGS" --clobber
+            fi
+            FOUND="${FOUND} ${ARCH}"
+            echo "${ARCH}: ${ASSET}"
+          done
+          FOUND=$(printf '%s' "$FOUND" | sed 's/^ //')
+          if [ -z "$FOUND" ]; then
+            echo "::error::No .pkg.tar.zst assets found on ${REPO}@${TAG} for any requested architecture. Add 'arch' to the release pipeline's formats input."
+            exit 1
+          fi
+          # The pkgname pacman will know the app by comes from .PKGINFO (the
+          # nfpm config's name:), which is allowed to differ from the
+          # filename stem.
+          FIRST_ARCH="${FOUND%% *}"
+          PKGNAME=$(tar -xOf "${PKGS}/${PRODUCT}-${PKGVER}-1-${FIRST_ARCH}.pkg.tar.zst" .PKGINFO | sed -n 's/^pkgname = //p')
+          [ -n "$PKGNAME" ] || { echo "::error::Could not read pkgname from the package's .PKGINFO"; exit 1; }
+          echo "arches=$FOUND" >> "$GITHUB_OUTPUT"
+          echo "pkgname=$PKGNAME" >> "$GITHUB_OUTPUT"
+          echo "pkgs=$PKGS" >> "$GITHUB_OUTPUT"
+
+      - name: Import signing key
+        id: sign
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+          LINUX_GPG_KEY_ID: ${{ secrets.LINUX_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LINUX_GPG_PRIVATE_KEY:-}" ]; then
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No LINUX_GPG_PRIVATE_KEY — publishing an unsigned repository (users need SigLevel Optional TrustAll)."
+            exit 0
+          fi
+          KEY_FILE="${RUNNER_TEMP}/linux-signing.asc"
+          if printf '%s' "$LINUX_GPG_PRIVATE_KEY" | grep -q 'BEGIN PGP PRIVATE KEY'; then
+            printf '%s\n' "$LINUX_GPG_PRIVATE_KEY" > "$KEY_FILE"
+          else
+            printf '%s' "$LINUX_GPG_PRIVATE_KEY" | base64 --decode > "$KEY_FILE"
+          fi
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf
+          echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf
+          gpgconf --kill gpg-agent || true
+          gpg --batch --yes ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} --import "$KEY_FILE"
+          rm -f "$KEY_FILE"
+          KEY_ID="${LINUX_GPG_KEY_ID:-$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')}"
+          printf '%s:6:\n' "$KEY_ID" | gpg --batch --import-ownertrust
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+
+      # A package whose release signature does not verify must never enter
+      # the repo; one that shipped unsigned (signing enabled later) is signed
+      # now so the repository is uniformly signed.
+      - name: Verify or create package signatures
+        if: steps.sign.outputs.signing == 'true'
+        env:
+          PKGS: ${{ steps.assets.outputs.pkgs }}
+          KEY_ID: ${{ steps.sign.outputs.key_id }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          for PKG in "$PKGS"/*.pkg.tar.zst; do
+            if [ -f "${PKG}.sig" ]; then
+              gpg --verify "${PKG}.sig" "$PKG" \
+                || { echo "::error::$(basename "$PKG") has a .sig on the release that does not verify against the imported key"; exit 1; }
+            else
+              gpg --batch --yes -u "$KEY_ID" ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} \
+                --output "${PKG}.sig" --detach-sign "$PKG"
+              echo "Signed $(basename "$PKG") (release carried no .sig)."
+            fi
+          done
+
+      # Everything from here on happens through two shell functions so the
+      # concurrent-release retry can re-run them from a fresh remote state:
+      #   stage_repo  — sync the hosting repo, lay the packages in, repo-add
+      #                 in an Arch container, sign the database, prune
+      #   push_repo   — commit and push; a rejection = another app released
+      #                 concurrently, so re-stage from their newer state
+      # The pacman -S install validation runs once, against the first staged
+      # tree — package installability does not change with a re-stage.
+      - name: Stage, validate and publish
+        id: publish
+        env:
+          ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
+          PAGES_REPO: ${{ inputs.pages_repo }}
+          PAGES_BRANCH: ${{ inputs.pages_branch }}
+          REPO_NAME: ${{ inputs.repo_name }}
+          PRODUCT: ${{ inputs.product_name }}
+          PKGNAME: ${{ steps.assets.outputs.pkgname }}
+          PKGVER: ${{ steps.rel.outputs.pkgver }}
+          FOUND_ARCHES: ${{ steps.assets.outputs.arches }}
+          PKGS: ${{ steps.assets.outputs.pkgs }}
+          KEEP: ${{ inputs.keep }}
+          SIGNING: ${{ steps.sign.outputs.signing }}
+          KEY_ID: ${{ steps.sign.outputs.key_id }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          STAGE="${RUNNER_TEMP}/stage"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+          PUSHING=true
+          if [ "$DRY_RUN" = "true" ]; then
+            PUSHING=false
+            echo "::notice::dry_run — the repository will be staged and validated but not pushed."
+          elif [ -z "${ARCH_REPO_TOKEN:-}" ]; then
+            PUSHING=false
+            echo "::warning::ARCH_REPO_TOKEN not set — the repository was staged and validated but not published. Add the secret (Contents:RW on ${PAGES_REPO}) to publish."
+          fi
+
+          REMOTE="https://x-access-token:${ARCH_REPO_TOKEN:-anonymous}@github.com/${PAGES_REPO}.git"
+
+          stage_repo() {
+            rm -rf "$STAGE"
+            if [ "$PUSHING" = "true" ]; then
+              # --branch on a branch that does not exist yet fails with
+              # "Remote branch … not found" — that case creates the branch.
+              # Anything else (repo missing, token rejected) is a
+              # half-configured channel: fail, do not degrade.
+              if ! git clone --depth 1 --branch "$PAGES_BRANCH" "$REMOTE" "$STAGE" 2>"${RUNNER_TEMP}/clone.log"; then
+                if grep -qi 'remote branch' "${RUNNER_TEMP}/clone.log"; then
+                  git clone --depth 1 "$REMOTE" "$STAGE"
+                  git -C "$STAGE" checkout -B "$PAGES_BRANCH"
+                else
+                  echo "::error::Cannot clone ${PAGES_REPO} with ARCH_REPO_TOKEN — does the repo exist, and does the token have Contents:RW on it?"
+                  cat "${RUNNER_TEMP}/clone.log"
+                  exit 1
+                fi
+              fi
+            else
+              mkdir -p "$STAGE"
+              git -C "$STAGE" init -q -b "$PAGES_BRANCH"
+            fi
+
+            for ARCH in $FOUND_ARCHES; do
+              mkdir -p "${STAGE}/${ARCH}"
+              cp "${PKGS}/${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst" "${STAGE}/${ARCH}/"
+              [ -f "${PKGS}/${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst.sig" ] \
+                && cp "${PKGS}/${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst.sig" "${STAGE}/${ARCH}/"
+
+              # Prune superseded versions of THIS package only (the [0-9]
+              # guard keeps myapp-* from matching a myapp-extra package).
+              # The database only references the version repo-add is about to
+              # write, so deleting older files never breaks an install.
+              ls "${STAGE}/${ARCH}/" 2>/dev/null \
+                | grep -E "^${PRODUCT}-[0-9][^-]*-[0-9]+-${ARCH}\.pkg\.tar\.zst$" \
+                | grep -vx "${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst" \
+                | sort -V | head -n -"$KEEP" \
+                | while read -r OLD; do
+                    echo "Pruning superseded ${ARCH}/${OLD}"
+                    rm -f "${STAGE}/${ARCH}/${OLD}" "${STAGE}/${ARCH}/${OLD}.sig"
+                  done
+
+              # repo-add appends to / replaces in the EXISTING database, so
+              # other apps' entries survive. It runs in a real Arch container
+              # because repo-add is pacman's own script, not something to
+              # reimplement. It refreshes the symlinked names; git and GitHub
+              # Pages need real files, so the copies are made afterwards.
+              docker run --rm -v "${STAGE}/${ARCH}:/repo" archlinux:base bash -euo pipefail -c "
+                cd /repo
+                rm -f '${REPO_NAME}.db' '${REPO_NAME}.files'
+                repo-add '${REPO_NAME}.db.tar.gz' '${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst'
+                # repo-add leaves symlinked names and .old backups; git and
+                # GitHub Pages want real files and no churn.
+                rm -f '${REPO_NAME}.db' '${REPO_NAME}.files' ./*.old
+                cp '${REPO_NAME}.db.tar.gz' '${REPO_NAME}.db'
+                cp '${REPO_NAME}.files.tar.gz' '${REPO_NAME}.files'
+              "
+              sudo chown -R "$(id -u):$(id -g)" "${STAGE}/${ARCH}"
+
+              if [ "$SIGNING" = "true" ]; then
+                for DB in "${REPO_NAME}.db" "${REPO_NAME}.db.tar.gz" "${REPO_NAME}.files" "${REPO_NAME}.files.tar.gz"; do
+                  gpg --batch --yes -u "$KEY_ID" ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} \
+                    --output "${STAGE}/${ARCH}/${DB}.sig" --detach-sign "${STAGE}/${ARCH}/${DB}"
+                done
+              fi
+            done
+
+            # The public key at a stable URL, so setup instructions can say
+            # `pacman-key --add` against the repo root.
+            if [ "$SIGNING" = "true" ]; then
+              gpg --armor --export "$KEY_ID" > "${STAGE}/${REPO_NAME}.asc"
+            fi
+          }
+
+          # Subshell body ON PURPOSE: a retry's stage_repo does rm -rf on
+          # $STAGE, which must never be the shell's working directory.
+          push_repo() (
+            cd "$STAGE"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Repository unchanged — nothing to push."
+              return 0
+            fi
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -q -m "${PKGNAME} ${PKGVER}-1 (${FOUND_ARCHES// /, })"
+            git push origin "HEAD:${PAGES_BRANCH}"
+          )
+
+          stage_repo
+
+          # Validate before anything is pushed: a real pacman syncs from the
+          # staged tree and installs the package, resolving its declared
+          # dependencies against the live Arch repos — which also proves the
+          # nfpm archlinux depends names actually exist in Arch. Containers
+          # are x86_64; an aarch64-only update skips the install (its
+          # database entry was still written and is listed below).
+          if printf '%s' "$FOUND_ARCHES" | grep -q 'x86_64'; then
+            docker run --rm -v "${STAGE}:/stage:ro" archlinux:base bash -euo pipefail -c "
+              printf '[%s]\nSigLevel = Never\nServer = file:///stage/\$arch\n' '${REPO_NAME}' >> /etc/pacman.conf
+              pacman -Sy --noconfirm >/dev/null
+              pacman -Si '${PKGNAME}' | grep -E 'Repository|Name|Version'
+              pacman -S --noconfirm '${PKGNAME}' >/dev/null
+              pacman -Q '${PKGNAME}'
+              pacman -Ql '${PKGNAME}' | grep -E '/usr/bin/.+' \
+                || { echo '::error::Installed package placed nothing in /usr/bin'; exit 1; }
+              echo 'pacman installed ${PKGNAME} from the staged repository.'
+            "
+          else
+            echo "::notice::No x86_64 package in this update — skipping the container install test (aarch64 cannot run on the runner)."
+          fi
+          for ARCH in $FOUND_ARCHES; do
+            echo "--- ${ARCH}/${REPO_NAME}.db ---"
+            tar -tzf "${STAGE}/${ARCH}/${REPO_NAME}.db.tar.gz"
+          done
+
+          if [ "$PUSHING" != "true" ]; then
+            exit 0
+          fi
+
+          # Push, and on a rejected push (another app released into the same
+          # hosting repo mid-run) re-stage from the remote's new state so
+          # repo-add runs against THEIR database, then try again.
+          ATTEMPTS=3
+          for i in $(seq 1 "$ATTEMPTS"); do
+            if push_repo; then
+              OWNER="${PAGES_REPO%%/*}"; NAME="${PAGES_REPO##*/}"
+              echo "::notice::Published ${PKGNAME} ${PKGVER}-1 to the '${REPO_NAME}' pacman repo — Server = https://${OWNER}.github.io/${NAME}/\$arch"
+              exit 0
+            fi
+            if [ "$i" -lt "$ATTEMPTS" ]; then
+              echo "::warning::Push to ${PAGES_REPO} rejected (concurrent release?) — re-staging from the updated remote (attempt $((i + 1))/${ATTEMPTS})"
+              stage_repo
+            fi
+          done
+          echo "::error::Could not push to ${PAGES_REPO} after ${ATTEMPTS} attempts"
+          exit 1
+
+      # The staged tree, pushed or not: what a dry run is for, and what a
+      # failed push leaves behind for inspection. Do NOT set
+      # include-hidden-files: the default exclusion is what keeps .git — the
+      # clone whose remote URL embeds ARCH_REPO_TOKEN — out of the artifact.
+      - name: Upload the staged repository as a workflow artifact
+        if: always() && steps.publish.outputs.stage != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: pacman-repo-${{ inputs.product_name }}
+          path: ${{ steps.publish.outputs.stage }}
+          if-no-files-found: warn
+          retention-days: 30

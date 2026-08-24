@@ -1,8 +1,9 @@
 # Reusable Linux release workflow for any compiled desktop app: native
-# x86_64 + aarch64 legs on a pinned glibc baseline, .deb + .rpm via nfpm,
-# AppImage via linuxdeploy, one GPG key signing the AppImage + the RPM + a
-# SHA256SUMS manifest, changelog guard, pre-publish verification, and
-# cross-repo publishing to a public releases mirror.
+# x86_64 + aarch64 legs on a pinned glibc baseline, .deb + .rpm + Arch
+# .pkg.tar.zst via nfpm, AppImage via linuxdeploy, one GPG key signing the
+# AppImage + the RPM + the Arch package + a SHA256SUMS manifest, changelog
+# guard, pre-publish verification, and cross-repo publishing to a public
+# releases mirror.
 #
 # The sibling tauri-release-kit owns Tauri apps (its bundler emits these same
 # formats). This kit is for everything else — iced, COSMIC, egui, GTK-rs,
@@ -91,9 +92,11 @@ on:
         default: ''
       formats:
         description: >-
-          Comma-separated package formats (subset of: deb, rpm, appimage).
-          deb is what the Flatpak, AUR and Snap workflows repack; rpm is what
-          COPR repacks. Every listed format must be produced on every leg.
+          Comma-separated package formats (subset of: deb, rpm, appimage,
+          arch). deb is what the Flatpak, AUR and Snap workflows repack; rpm
+          is what COPR repacks; arch is a native pacman .pkg.tar.zst — what
+          arch-repo.yml publishes and `pacman -U <url>` installs directly.
+          Every listed format must be produced on every leg.
         required: false
         type: string
         default: 'deb,rpm,appimage'
@@ -338,8 +341,8 @@ jobs:
           FORMAT_LIST=$(norm "$FORMATS")
           [ -n "$FORMAT_LIST" ] || { echo "::error::formats input resolved to an empty set"; exit 1; }
           for f in $FORMAT_LIST; do
-            printf '%s\n' deb rpm appimage | grep -qx -- "$f" \
-              || { echo "::error::Unknown format '$f' (allowed: deb, rpm, appimage)"; exit 1; }
+            printf '%s\n' deb rpm appimage arch | grep -qx -- "$f" \
+              || { echo "::error::Unknown format '$f' (allowed: deb, rpm, appimage, arch)"; exit 1; }
           done
           FORMATS_CSV=$(printf '%s\n' $FORMAT_LIST | paste -sd, -)
           MATRIX=$(printf '%s\n' $BUILD_LIST | jq -cRn --argjson legs "$LEGS" --arg fm "$FORMATS_CSV" \
@@ -456,13 +459,14 @@ jobs:
       #   gettext-base — envsubst for binary_path
       #   desktop-file-utils — validates the .desktop before it ships
       #   file — asserts the binary is really the leg's architecture
+      #   zstd — lets tar inspect the Arch .pkg.tar.zst after nfpm writes it
       - name: Install packaging dependencies
         env:
           APT_PACKAGES: ${{ inputs.apt_packages }}
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y rpm gettext-base desktop-file-utils file $APT_PACKAGES
+          sudo apt-get install -y rpm gettext-base desktop-file-utils file zstd $APT_PACKAGES
           sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
 
       - name: Setup Rust
@@ -639,8 +643,8 @@ jobs:
               ;;
           esac
           case ",$FORMATS," in
-            *,deb,*|*,rpm,*)
-              [ -f "$NFPM_CONFIG" ] || { echo "::error::deb/rpm need an nfpm config; none at '${NFPM_CONFIG}' (nfpm_config input). Start from templates/nfpm.yaml."; exit 1; }
+            *,deb,*|*,rpm,*|*,arch,*)
+              [ -f "$NFPM_CONFIG" ] || { echo "::error::deb/rpm/arch need an nfpm config; none at '${NFPM_CONFIG}' (nfpm_config input). Start from templates/nfpm.yaml."; exit 1; }
               ;;
           esac
           if [ -n "${METAINFO:-}" ] && [ ! -f "$METAINFO" ]; then
@@ -652,12 +656,13 @@ jobs:
           echo "metainfo=${METAINFO:-}" >> "$GITHUB_OUTPUT"
           echo "nfpm=$NFPM_CONFIG" >> "$GITHUB_OUTPUT"
 
-      # nfpm writes deb AND rpm from one config, with per-packager overrides
-      # for the names that differ (a Fedora `Requires:` is not a Debian
-      # `Depends:`). Installed from its GitHub release for the leg's
-      # architecture — the apt repo lags and `go install` needs a toolchain.
+      # nfpm writes deb AND rpm AND the Arch package from one config, with
+      # per-packager overrides for the names that differ (a Fedora `Requires:`
+      # is not a Debian `Depends:`). Installed from its GitHub release for the
+      # leg's architecture — the apt repo lags and `go install` needs a
+      # toolchain.
       - name: Install nfpm
-        if: contains(matrix.formats, 'deb') || contains(matrix.formats, 'rpm')
+        if: contains(matrix.formats, 'deb') || contains(matrix.formats, 'rpm') || contains(matrix.formats, 'arch')
         env:
           GH_TOKEN: ${{ github.token }}
           NFPM_VERSION: ${{ inputs.nfpm_version }}
@@ -714,6 +719,50 @@ jobs:
           echo "--- $(basename "$OUT") ---"
           rpm -qip "$OUT"
           rpm -qlp "$OUT"
+
+      # Native pacman package via nfpm's archlinux packager. Two version
+      # quirks this step compensates for (both verified against nfpm 2.47 and
+      # pacman's vercmp):
+      #   - nfpm silently DROPS a semver prerelease for this packager: fed
+      #     1.2.3-beta.1 it writes pkgver = 1.2.3, so a beta would masquerade
+      #     as the stable release. The version is therefore mapped to the
+      #     Arch form BEFORE nfpm sees it.
+      #   - Arch forbids '-' in pkgver, and the underscore form people reach
+      #     for sorts the WRONG way: vercmp puts 1.2.3_beta.1 AFTER 1.2.3.
+      #     Deleting the hyphens instead (1.2.3beta.1) sorts before the
+      #     stable release, and alpha < beta < rc orders alphabetically.
+      # The signature is pacman's native detached .sig uploaded next to the
+      # package: repo-add folds it into the repo database, and pacman fetches
+      # it whenever the user's SigLevel asks for one.
+      - name: Package Arch (.pkg.tar.zst)
+        if: contains(matrix.formats, 'arch')
+        env:
+          NFPM_CONFIG: ${{ steps.assets.outputs.nfpm }}
+          SIGNING: ${{ steps.linux_sign.outputs.signing }}
+          KEY_ID: ${{ steps.linux_sign.outputs.key_id }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          ARCH_PKGVER="${RK_VERSION//-/}"
+          OUT="${DIST}/${RK_PRODUCT}-${ARCH_PKGVER}-1-${RK_ARCH}.pkg.tar.zst"
+          RK_VERSION="$ARCH_PKGVER" nfpm package --config "$NFPM_CONFIG" --packager archlinux --target "$OUT"
+          echo "--- $(basename "$OUT") ---"
+          tar -tf "$OUT"
+          # Same downstream contract as the .deb: an executable under
+          # /usr/bin, checked here rather than in the pacman-repo workflow.
+          tar -tf "$OUT" | grep -qE '^usr/bin/[^/]+$' \
+            || { echo "::error::The Arch package installs nothing under /usr/bin — check the contents: block of ${NFPM_CONFIG}"; exit 1; }
+          # Prove the prerelease mapping survived nfpm — this is the check
+          # that catches a future nfpm changing its version handling.
+          PKGVER_IN=$(tar -xOf "$OUT" .PKGINFO | sed -n 's/^pkgver = //p')
+          [ "$PKGVER_IN" = "${ARCH_PKGVER}-1" ] \
+            || { echo "::error::.PKGINFO carries pkgver '${PKGVER_IN}', expected '${ARCH_PKGVER}-1' — nfpm's archlinux version handling changed"; exit 1; }
+          if [ "$SIGNING" = "true" ]; then
+            gpg --batch --yes -u "$KEY_ID" ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} \
+              --output "${OUT}.sig" --detach-sign "$OUT"
+            gpg --verify "${OUT}.sig" "$OUT"
+            echo "Arch package signed + verified against ${KEY_ID}."
+          fi
 
       # linuxdeploy assembles the AppDir (binary, .desktop, icon, AppRun) and
       # bundles every shared library the binary links except the blacklisted
@@ -891,6 +940,7 @@ jobs:
               'linux-aarch64': { arch: 'aarch64', deb: 'arm64', rpm: 'aarch64' },
             };
             const rpmVersion = BARE.replace(/-/g, '~');
+            const archPkgver = BARE.replace(/-/g, '');
             const expected = [];
             for (const t of TARGETS.split(',')) {
               const leg = legs[t];
@@ -898,6 +948,10 @@ jobs:
                 if (f === 'deb') expected.push(`${PRODUCT}_${BARE}_${leg.deb}.deb`);
                 if (f === 'rpm') expected.push(`${PRODUCT}-${rpmVersion}-1.${leg.rpm}.rpm`);
                 if (f === 'appimage') expected.push(`${PRODUCT}_${BARE}_${leg.arch}.AppImage`);
+                if (f === 'arch') {
+                  expected.push(`${PRODUCT}-${archPkgver}-1-${leg.arch}.pkg.tar.zst`);
+                  if (SIGNING === 'true') expected.push(`${PRODUCT}-${archPkgver}-1-${leg.arch}.pkg.tar.zst.sig`);
+                }
               }
             }
             expected.push('SHA256SUMS');

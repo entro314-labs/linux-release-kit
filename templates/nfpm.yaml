@@ -1,6 +1,8 @@
-# nfpm config for the .deb and .rpm — one file, two packagers.
-# Copy to packaging/linux/nfpm.yaml (or point the release workflow's
-# nfpm_config input at it). Reference: https://nfpm.goreleaser.com/configuration/
+# nfpm config for the .deb, .rpm and Arch .pkg.tar.zst — one file, three
+# packagers. Copy to packaging/linux/nfpm.yaml (or point the release
+# workflow's nfpm_config input at it).
+# Reference: https://nfpm.goreleaser.com/configuration/
+# COSMIC apps/applets: start from nfpm-cosmic.yaml instead.
 #
 # The RK_* variables are exported by the release workflow for the leg being
 # built; nfpm expands ${VAR} itself. You never edit the version here.
@@ -36,6 +38,11 @@ overrides:
   rpm:
     depends:
       - gtk4
+  # Arch package names — validated for real by arch-repo.yml, whose install
+  # test resolves them against the live Arch repos.
+  archlinux:
+    depends:
+      - gtk4
 
 contents:
   - src: ${RK_BINARY_PATH}
@@ -65,7 +72,9 @@ contents:
     type: doc
 
 # Optional maintainer scripts (the AUR and COPR repacks do not carry these
-# over; Arch's .install and Fedora's file triggers refresh caches instead).
+# over; Arch's .install and Fedora's file triggers refresh caches instead —
+# and the native Arch package needs none at all: pacman's alpm hooks refresh
+# icon and desktop-entry caches for any package touching those paths).
 # scripts:
 #   postinstall: packaging/linux/postinstall.sh
 #   postremove: packaging/linux/postremove.sh

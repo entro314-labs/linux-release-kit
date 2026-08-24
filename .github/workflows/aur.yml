@@ -131,10 +131,14 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          # Arch forbids '-' in pkgver (it separates pkgver from pkgrel), so a
-          # prerelease tag maps to the underscore form Arch uses: 1.0.0-beta.1
-          # becomes 1.0.0_beta.1, which still sorts correctly under vercmp.
-          PKGVER="${VERSION//-/_}"
+          # Arch forbids '-' in pkgver (it separates pkgver from pkgrel). The
+          # hyphens are DELETED, not underscored: vercmp sorts 1.0.0_beta.1
+          # AFTER 1.0.0 (an extra segment reads as newer), while 1.0.0beta.1
+          # sorts before it — and alpha < beta < rc orders alphabetically.
+          # Must stay in lockstep with the arch step in release.yml and with
+          # arch-repo.yml, or the AUR package and the pacman repo disagree on
+          # what version an upgrade is.
+          PKGVER="${VERSION//-/}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "pkgver=$PKGVER" >> "$GITHUB_OUTPUT"

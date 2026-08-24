@@ -1,6 +1,6 @@
 # Linux signing
 
-One GPG key, three signatures per release, zero runtime enforcement. This
+One GPG key, one signature set per release, zero runtime enforcement. This
 page is the setup and the reasoning; the workflow does the rest.
 
 ## Who signs what
@@ -10,6 +10,8 @@ page is the setup and the reasoning; the workflow does the rest.
 | AppImage | Embedded GPG signature (`SIGN=1` via appimagetool) | `release.yml` build leg | `./App.AppImage --appimage-signature`, the AppImage `validate` tool |
 | `.rpm` | Embedded GPG signature (`rpmsign --addsign`) | `release.yml` build leg | `rpm -K` after `rpm --import` |
 | `.deb` | **Not signed** (convention — apt trusts repository metadata, not packages) | — | `SHA256SUMS` |
+| Arch `.pkg.tar.zst` | Detached binary signature `.sig` (pacman's native form) | `release.yml` build leg | pacman, per the user's `SigLevel` |
+| pacman repo database | Detached `.sig` on `<repo>.db` / `.files` | `arch-repo.yml` | pacman, per the user's `SigLevel` |
 | `SHA256SUMS` | Detached armored signature `SHA256SUMS.asc` | `release.yml` checksums job | `gpg --verify` |
 | Flatpak bundle / Flathub | OSTree repo-level signing | Flathub's infrastructure | Flatpak |
 | Snap | Store assertions | Canonical | snapd |
@@ -120,11 +122,42 @@ rpm -K myapp-X.Y.Z-1.x86_64.rpm
 ./validate-x86_64.AppImage myapp_X.Y.Z_x86_64.AppImage
 ```
 
+## The pacman repository
+
+`arch-repo.yml` signs the packages (detached `.sig` next to each file — the
+release already carries them) and the repo database, and publishes the
+public key at the repo root as `<repo_name>.asc`. What users put in
+`/etc/pacman.conf` decides how much of that pacman enforces:
+
+```ini
+# Unsigned repo, or "just work" mode — no key setup:
+[myrepo]
+SigLevel = Optional TrustAll
+Server = https://OWNER.github.io/REPO/$arch
+```
+
+```sh
+# Full verification: import + locally sign the key once…
+sudo pacman-key --add <(curl -sL https://OWNER.github.io/REPO/myrepo.asc)
+sudo pacman-key --lsign-key <FPR>
+```
+
+```ini
+# …then require signatures on both packages and database:
+[myrepo]
+SigLevel = Required DatabaseRequired
+Server = https://OWNER.github.io/REPO/$arch
+```
+
+`pacman -U <release-url>` users get the same `.sig` from the release page;
+their `SigLevel` for URL installs is governed by the `[options]` section.
+
 ## If you later run your own apt / dnf repository
 
 The same key signs repository metadata — `gpg --clearsign -o InRelease
 Release` and `gpg -abs -o Release.gpg Release` for apt, `repodata/repomd.xml
 .asc` for dnf. Standalone `.deb` files stay unsigned even then; that is how
 Debian's trust model works. Tools like `aptly`, `reprepro` or a hosted
-package service take the released artifacts as input — this kit
-deliberately stops at GitHub Releases.
+package service take the released artifacts as input — for apt/dnf this kit
+deliberately stops at GitHub Releases. (pacman is the exception: its
+repository format is simple enough that `arch-repo.yml` hosts one outright.)

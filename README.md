@@ -3,13 +3,14 @@
 Shared CI/CD for Linux desktop apps that are **not** Tauri (those have
 [tauri-release-kit](../tauri-release-kit)): iced, COSMIC, egui, GTK-rs, C,
 Go — anything that compiles to one ELF binary plus a `.desktop` file and an
-icon. One reusable release pipeline builds `.deb` + `.rpm` + AppImage
-natively on x86_64 and aarch64 against a pinned glibc baseline, signs the
-AppImage, the RPM and a `SHA256SUMS` manifest with one GPG key, verifies the
-draft, and publishes it — plus companion workflows that push the same
-release onward to **Flathub**, the **AUR**, **Fedora COPR** and the
-**Snap Store**, every one of them a repack of the artifact users already
-downloaded, never a second build.
+icon. One reusable release pipeline builds `.deb` + `.rpm` + AppImage +
+Arch `.pkg.tar.zst` natively on x86_64 and aarch64 against a pinned glibc
+baseline, signs the AppImage, the RPM, the Arch package and a `SHA256SUMS`
+manifest with one GPG key, verifies the draft, and publishes it — plus
+companion workflows that push the same release onward to **Flathub**, a
+**self-hosted pacman repository**, the **AUR**, **Fedora COPR** and the
+**Snap Store**, every one of them a repack (or direct re-serve) of the
+artifact users already downloaded, never a second build.
 
 Every optional piece degrades gracefully: no credentials means that channel
 skips itself with a warning, never a failed release. A *half*-configured one
@@ -24,12 +25,13 @@ and publishing are the kit's.
 | --- | --- |
 | `.github/workflows/release.yml` | Tag-triggered release: build → package → sign → checksum → verify → publish |
 | `.github/workflows/flatpak.yml` | Repacks the released `.deb` into a Flatpak bundle + Flathub manifest |
+| `.github/workflows/arch-repo.yml` | Publishes the released `.pkg.tar.zst` into a self-hosted, Pages-served pacman repository |
 | `.github/workflows/aur.yml` | Renders, validates and publishes a `-bin` PKGBUILD to the AUR |
 | `.github/workflows/copr.yml` | Repacks the released `.rpm` into an SRPM and submits it to a COPR project |
 | `.github/workflows/snap.yml` | Repacks the released `.deb` into a strict snap and uploads it to the Snap Store |
 
-All five are `workflow_call` reusable workflows — fixes land here once and
-every app picks them up. The last four chain off `release.yml` with `needs:`
+All six are `workflow_call` reusable workflows — fixes land here once and
+every app picks them up. The last five chain off `release.yml` with `needs:`
 in one caller file; see [`templates/release.yml`](templates/release.yml).
 
 **Pinning.** Reference the kit at a reviewed commit SHA
@@ -41,8 +43,9 @@ together.
 
 | Channel | Built from | Wired by | Signed by |
 | --- | --- | --- | --- |
-| Direct download (`.deb` / `.rpm` / AppImage) | source, on ubuntu-22.04 | `release.yml` | you (GPG) |
+| Direct download (`.deb` / `.rpm` / AppImage / `.pkg.tar.zst`) | source, on ubuntu-22.04 | `release.yml` | you (GPG) |
 | Flathub / Flatpak bundle | the released `.deb` | `flatpak.yml` | Flathub |
+| Self-hosted pacman repository | the released `.pkg.tar.zst`, re-served | `arch-repo.yml` | you (GPG) |
 | Arch User Repository | the released `.deb` | `aur.yml` | — (sha256 pins) |
 | Fedora COPR | the released `.rpm` | `copr.yml` | COPR |
 | Snap Store | the released `.deb` | `snap.yml` | Canonical |
@@ -51,6 +54,28 @@ Not included, on purpose: a Launchpad PPA (needs full `debian/` source
 packaging and vendored dependencies for reach the `.deb` + Flatpak + Snap
 already cover) and a self-hosted apt/dnf repository (takes these artifacts as
 input; see [docs/SIGNING.md](docs/SIGNING.md)).
+
+### The Arch story
+
+Arch users get three doors, in order of preference:
+
+1. **The pacman repository** (`arch-repo.yml`) — a real repo served by
+   GitHub Pages from one shared git repo covering all your apps. Users add
+   three lines to `/etc/pacman.conf` once and get installs *and upgrades*
+   through plain `pacman -Syu`. No AUR account, no AUR helper, and it keeps
+   working when the AUR is not accepting submissions. Hosting-repo setup is
+   in the [`arch-repo.yml`](.github/workflows/arch-repo.yml) header.
+2. **`pacman -U <release-url>`** — the release carries a native
+   `.pkg.tar.zst` (with `arch` in `formats`), so a one-off install needs no
+   repo at all and still gets dependency tracking and clean uninstall.
+3. **The AUR** (`aur.yml`) — the discovery listing, for when the AUR is
+   open. Leave the job wired with `dry_run: true` (or without the SSH key):
+   it validates every release and publishes the day you flip it on.
+
+One version rule binds all three: Arch forbids `-` in `pkgver`, and the
+hyphens are **deleted**, not underscored — `1.2.3-beta.1` becomes
+`1.2.3beta.1`, which `vercmp` sorts *before* `1.2.3` (the underscore form
+sorts after it, i.e. a beta would out-rank the stable release).
 
 ## The glibc rule
 
@@ -75,7 +100,9 @@ the baseline from the `.deb`/`.rpm`.
 
 2. **Packaging directory** — `packaging/linux/` with:
    - `nfpm.yaml` from [`templates/nfpm.yaml`](templates/nfpm.yaml) — deb +
-     rpm metadata, runtime dependencies per distro, file layout
+     rpm + Arch metadata, runtime dependencies per distro, file layout
+     (COSMIC apps/applets: start from
+     [`templates/nfpm-cosmic.yaml`](templates/nfpm-cosmic.yaml) instead)
    - `<product_name>.desktop` from
      [`templates/myapp.desktop`](templates/myapp.desktop)
    - `<product_name>.png` — 256×256 icon whose basename equals the desktop
@@ -115,6 +142,9 @@ the baseline from the `.deb`/`.rpm`.
 6. **Channel credentials (all optional)**:
    - Flathub: none for the bundle; submitting to Flathub is a manual PR with
      the manifest the workflow emits as an artifact
+   - pacman repo: `ARCH_REPO_TOKEN` (fine-grained PAT, Contents:RW on the
+     hosting repo) after the one-time hosting-repo setup in the
+     [`arch-repo.yml`](.github/workflows/arch-repo.yml) header
    - AUR: `AUR_SSH_PRIVATE_KEY` (public half registered on your AUR account)
    - COPR: `COPR_API_CONFIG` (the config file from
      copr.fedorainfracloud.org/api, pasted whole); create the project and
@@ -192,13 +222,16 @@ Every downstream workflow matches on these exact names; they are built from
 | --- | --- | --- |
 | `.deb` | `<product>_<ver>_amd64.deb` | `<product>_<ver>_arm64.deb` |
 | `.rpm` | `<product>-<ver>-1.x86_64.rpm` | `<product>-<ver>-1.aarch64.rpm` |
+| Arch | `<product>-<pkgver>-1-x86_64.pkg.tar.zst` (+ `.sig`) | `<product>-<pkgver>-1-aarch64.pkg.tar.zst` (+ `.sig`) |
 | AppImage | `<product>_<ver>_x86_64.AppImage` | `<product>_<ver>_aarch64.AppImage` |
 | Checksums | `SHA256SUMS`, `SHA256SUMS.asc`, `<FPR>.asc` | |
 
 A prerelease `1.0.0-beta.1` keeps its dash in the `.deb`/AppImage names and
 uses RPM's tilde form in the `.rpm` (`1.0.0~beta.1`, which sorts *before*
-`1.0.0` as it should). The AUR maps it to `1.0.0_beta.1`, the Snap Store
-channel to `beta`, and GitHub marks the release as a prerelease.
+`1.0.0` as it should). The Arch `pkgver` deletes the hyphens
+(`1.0.0beta.1` — see "The Arch story" for why not underscores), the AUR
+follows the same rule, the Snap Store channel maps to `beta`, and GitHub
+marks the release as a prerelease.
 
 ## Cross-repo tokens
 
@@ -225,16 +258,17 @@ that matter:
    `formats` drops a format nobody downloads.
 3. **Resume instead of recycling** — a failed leg is re-dispatched alone
    against the same draft (see the release ritual).
-4. **Channels are cheap** — flatpak/aur/copr/snap each take a few minutes
-   and download rather than rebuild. Run them with `dry_run: true` / no
-   credentials first; they validate end to end without publishing.
+4. **Channels are cheap** — flatpak/arch-repo/aur/copr/snap each take a few
+   minutes and download rather than rebuild. Run them with `dry_run: true` /
+   no credentials first; they validate end to end without publishing.
 
 ## Docs
 
 - [docs/SIGNING.md](docs/SIGNING.md) — the GPG key, what it signs, what
-  users run to verify, apt/dnf repository notes
-- [templates/](templates/) — the caller workflow, `nfpm.yaml`, desktop
-  entry, AppStream MetaInfo and `snapcraft.yaml` to copy into an app
+  users run to verify, pacman/apt/dnf repository notes
+- [templates/](templates/) — the caller workflow, `nfpm.yaml` (+ the COSMIC
+  variant `nfpm-cosmic.yaml`), desktop entry, AppStream MetaInfo and
+  `snapcraft.yaml` to copy into an app
 
 ## Relation to the other kits
 
