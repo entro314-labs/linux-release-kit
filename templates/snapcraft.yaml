@@ -1,0 +1,51 @@
+# snapcraft.yaml for the deb-repack snap the snap workflow builds.
+# Copy to snap/snapcraft.yaml in your app repo.
+#
+# The workflow downloads the released .deb to snap/local/app.deb (its
+# deb_staging_path input) and rewrites `version:` from the tag before
+# building, so nothing here changes between releases.
+#
+# Register the name FIRST: `snapcraft register myapp` — the store rejects
+# uploads for names it does not know.
+
+name: myapp                      # must match the registered store name
+base: core24
+version: '0.0.0'                 # rewritten by the snap workflow; keep the quotes
+summary: One-line summary under 79 characters
+description: |
+  A longer description shown on the store page. Markdown is not rendered;
+  plain paragraphs are.
+license: MIT
+grade: stable
+confinement: strict
+
+apps:
+  myapp:
+    command: usr/bin/myapp
+    desktop: usr/share/applications/myapp.desktop
+    # The gnome extension bundles the desktop plumbing every GUI snap needs
+    # (desktop, desktop-legacy, gsettings, opengl, wayland, x11, …) and a
+    # matching GTK/GNOME platform snap. Non-GTK toolkits still benefit from
+    # the interfaces it wires up.
+    extensions: [gnome]
+    plugs:
+      - home
+      # - network
+      # - audio-playback
+      # - removable-media
+
+parts:
+  app:
+    plugin: dump
+    source: snap/local/app.deb   # = the workflow's deb_staging_path
+    source-type: deb
+    # Runtime libraries the base/extension do not provide — the snap
+    # equivalents of nfpm.yaml's deb depends. `snapcraft` warns about
+    # missing libraries at the end of the build; add them here.
+    stage-packages: []
+    override-build: |
+      craftctl default
+      # snapd resolves Icon= against the snap's own filesystem only when it is
+      # an absolute ${SNAP} path; the bare name the .deb ships shows no icon.
+      sed -i 's|^Icon=.*|Icon=${SNAP}/usr/share/icons/hicolor/256x256/apps/myapp.png|' \
+        "$CRAFT_PART_INSTALL/usr/share/applications/myapp.desktop"

@@ -1,0 +1,265 @@
+# Reusable Snap workflow: repacks the .deb this kit's release pipeline already
+# published into a strictly-confined snap, smoke-installs it, optionally
+# uploads it to the Snap Store, and attaches it to the release.
+#
+# WHY FROM THE .deb: snapcraft's `dump` plugin extracts a .deb straight into
+# the snap's filesystem (`source-type: deb`), so the snap carries the exact
+# binary every other channel got and the build needs no toolchain inside the
+# LXD container. The caller's snap/snapcraft.yaml points a part at the staging
+# path this workflow fills — see templates/snapcraft.yaml.
+#
+# Run it AFTER release.yml has published the release (`needs: release` in the
+# caller): it downloads a published asset.
+#
+# GRACEFUL DEGRADATION: no SNAPCRAFT_STORE_CREDENTIALS means the snap is
+# built, installed as a smoke test and attached to the release — just not
+# uploaded to the store. No .deb for an architecture skips that architecture
+# with a warning.
+#
+# The snap NAME must be registered on snapcraft.io before the first upload
+# (`snapcraft register <name>`); the store rejects unknown names.
+
+name: Snap (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to package (vX.Y.Z). Defaults to the pushed tag ref.'
+        required: false
+        type: string
+        default: ''
+      releases_repo:
+        description: "'owner/name' hosting the release assets. Empty = this repo."
+        required: false
+        type: string
+        default: ''
+      product_name:
+        description: 'The .deb filename stem (release.yml product_name)'
+        required: true
+        type: string
+      project_dir:
+        description: 'Directory containing snap/snapcraft.yaml (passed to snapcraft as the project path)'
+        required: false
+        type: string
+        default: '.'
+      deb_staging_path:
+        description: >-
+          Where the downloaded .deb is placed for snapcraft, relative to the
+          repo root. The part in snapcraft.yaml must use this as its
+          `source:`. Keep it under snap/local/ so snapcraft ships nothing
+          else from the tree.
+        required: false
+        type: string
+        default: 'snap/local/app.deb'
+      arches:
+        description: >-
+          Comma-separated architectures to build (subset of: x86_64, aarch64).
+          Each needs a matching .deb on the release.
+        required: false
+        type: string
+        default: 'x86_64'
+      set_version:
+        description: >-
+          Rewrite the `version:` line of snapcraft.yaml to the release version
+          before building, so the committed file never has to be bumped.
+        required: false
+        type: boolean
+        default: true
+      store_channel:
+        description: >-
+          Snap Store channel to release into. Empty = derived from the tag:
+          plain → stable, -rc → candidate, -beta → beta, anything else → edge.
+        required: false
+        type: string
+        default: ''
+      attach_to_release:
+        description: 'Upload the built .snap to the GitHub release'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      SNAPCRAFT_STORE_CREDENTIALS:
+        description: >-
+          Output of `snapcraft export-login --snaps=<name> --channels=<...> -`.
+          Absent = build + smoke-test only, with a warning.
+        required: false
+      RELEASES_TOKEN:
+        description: 'Fine-grained PAT with Contents:RW on releases_repo. Required when releases_repo is set.'
+        required: false
+
+jobs:
+  snap:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    # The snap links against its core base, not the host — the glibc
+    # baseline does not apply.
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      - name: Select architecture
+        id: select
+        env:
+          ARCHES: ${{ inputs.arches }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case ",$(printf '%s' "$ARCHES" | tr -d '[:space:]')," in
+            *",${ARCH},"*) echo "selected=true"  >> "$GITHUB_OUTPUT" ;;
+            *)             echo "selected=false" >> "$GITHUB_OUTPUT"
+                           echo "${ARCH} not in the arches input — nothing to do." ;;
+          esac
+
+      - uses: actions/checkout@v7
+        if: steps.select.outputs.selected == 'true'
+
+      - name: Resolve release
+        id: rel
+        if: steps.select.outputs.selected == 'true'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASES_REPO: ${{ inputs.releases_repo }}
+          STORE_CHANNEL: ${{ inputs.store_channel }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::'$TAG' is not a semver release tag — pass the tag input explicitly when not running on a tag push"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          CHANNEL="$STORE_CHANNEL"
+          if [ -z "$CHANNEL" ]; then
+            case "$VERSION" in
+              *-rc*)   CHANNEL=candidate ;;
+              *-beta*) CHANNEL=beta ;;
+              *-*)     CHANNEL=edge ;;
+              *)       CHANNEL=stable ;;
+            esac
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the .deb into the staging path
+        id: deb
+        if: steps.select.outputs.selected == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ steps.rel.outputs.repo }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          PRODUCT: ${{ inputs.product_name }}
+          STAGING: ${{ inputs.deb_staging_path }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            x86_64)  DEB_ARCH=amd64 ;;
+            aarch64) DEB_ARCH=arm64 ;;
+            *) echo "::error::Unsupported architecture '$ARCH'"; exit 1 ;;
+          esac
+          ASSET="${PRODUCT}_${VERSION}_${DEB_ARCH}.deb"
+          if ! gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep -qx -- "$ASSET"; then
+            echo "::warning::No ${ASSET} on ${REPO}@${TAG} — skipping the ${ARCH} snap. Add 'deb' to the release pipeline's formats input if you want one."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$(dirname "$STAGING")"
+          gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --output "$STAGING" --clobber
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "Staged ${ASSET} at ${STAGING}"
+
+      - name: Set the snap version
+        if: steps.deb.outputs.found == 'true'
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          SET_VERSION: ${{ inputs.set_version }}
+        run: |
+          set -euo pipefail
+          FILE="${PROJECT_DIR}/snap/snapcraft.yaml"
+          [ -f "$FILE" ] || { echo "::error::No snapcraft.yaml at ${FILE}. Start from templates/snapcraft.yaml."; exit 1; }
+          if [ "$SET_VERSION" = "true" ]; then
+            # Snap versions are free-form strings up to 32 characters; the
+            # semver tag fits as-is.
+            sed -i -E "s/^version: .*/version: '${VERSION}'/" "$FILE"
+            grep -q "^version: '${VERSION}'" "$FILE" \
+              || { echo "::error::Could not rewrite the version: line in ${FILE} — is there one at the top level?"; exit 1; }
+          fi
+          grep -E '^(name|version|base|confinement):' "$FILE"
+
+      - name: Build the snap
+        id: build
+        if: steps.deb.outputs.found == 'true'
+        uses: snapcore/action-build@v1
+        with:
+          path: ${{ inputs.project_dir }}
+
+      # A strictly-confined snap can build cleanly and still be unusable —
+      # wrong `command:` path, a desktop file that does not resolve.
+      # Installing it (`--dangerous` because it is unsigned by the store)
+      # catches the first class; the command check catches the second.
+      - name: Smoke-test the snap
+        if: steps.deb.outputs.found == 'true'
+        env:
+          SNAP_FILE: ${{ steps.build.outputs.snap }}
+        run: |
+          set -euo pipefail
+          sudo snap install --dangerous "$SNAP_FILE"
+          NAME=$(basename "$SNAP_FILE" | cut -d_ -f1)
+          snap list "$NAME"
+          snap info "$NAME" | sed -n '1,12p'
+          # Commands are exposed as /snap/bin/<name>[.<app>]; at least one
+          # must exist or the snap defines no runnable app.
+          FOUND=false
+          for cmd in /snap/bin/"${NAME}" /snap/bin/"${NAME}".*; do
+            [ -e "$cmd" ] && FOUND=true && break
+          done
+          [ "$FOUND" = true ] \
+            || { echo "::error::The installed snap exposes no /snap/bin/${NAME}* command — check apps: in snapcraft.yaml"; exit 1; }
+          sudo snap remove "$NAME"
+
+      - name: Check store credentials
+        id: creds
+        if: steps.deb.outputs.found == 'true'
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -n "${SNAPCRAFT_STORE_CREDENTIALS:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SNAPCRAFT_STORE_CREDENTIALS not set — the snap was built and smoke-tested but not uploaded to the Snap Store. Export a login with 'snapcraft export-login' to publish."
+          fi
+
+      - name: Upload to the Snap Store
+        if: steps.deb.outputs.found == 'true' && steps.creds.outputs.present == 'true'
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: ${{ steps.rel.outputs.channel }}
+
+      - name: Attach the snap to the release
+        if: steps.deb.outputs.found == 'true' && inputs.attach_to_release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ steps.rel.outputs.repo }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          SNAP_FILE: ${{ steps.build.outputs.snap }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$SNAP_FILE" --repo "$REPO" --clobber
+
+      - name: Upload the snap as a workflow artifact
+        if: always() && steps.build.outputs.snap != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: snap-${{ matrix.arch }}
+          path: ${{ steps.build.outputs.snap }}
+          if-no-files-found: warn
+          retention-days: 30

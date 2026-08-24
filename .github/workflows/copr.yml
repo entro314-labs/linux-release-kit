@@ -1,0 +1,302 @@
+# Reusable COPR workflow: publishes the .rpm this kit's release pipeline
+# already signed and published to a Fedora COPR project, so Fedora/RHEL users
+# get `dnf install` plus updates through a repo they enabled once.
+#
+# WHY A REPACK SRPM: COPR only accepts source packages and builds them on its
+# own (network-less) builders. Rather than maintain a from-source spec with
+# vendored dependencies, the SRPM rendered here carries the released binary
+# RPM(s) as Source0/Source1 and its %install simply unpacks them with
+# rpm2cpio — the AUR `-bin` pattern, in RPM terms. Name, version, release,
+# summary, license and Requires are READ FROM the released .rpm, so the COPR
+# package cannot drift from it. (COPR permits prebuilt payloads; the official
+# Fedora repositories do not, which is why this is COPR and not a Fedora
+# package review.) Scriptlets from nfpm.yaml are not carried over — Fedora's
+# RPM file triggers refresh icon caches and desktop databases on their own.
+#
+# Run it AFTER release.yml has published the release (`needs: release` in the
+# caller): it downloads published assets.
+#
+# GRACEFUL DEGRADATION: without COPR_API_CONFIG (or with dry_run) the spec is
+# still rendered, the SRPM built, and a real x86_64 RPM rebuilt from it in a
+# Fedora container — everything but the upload. Run it that way first.
+#
+# ONE-TIME SETUP: create the project at https://copr.fedorainfracloud.org
+# (enable the x86_64 and aarch64 chroots you ship), then paste the contents
+# of https://copr.fedorainfracloud.org/api/ into the COPR_API_CONFIG secret.
+
+name: COPR (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      copr_project:
+        description: "COPR project as 'owner/project' or '@group/project'"
+        required: true
+        type: string
+      product_name:
+        description: 'The .rpm filename stem (release.yml product_name)'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag to package (vX.Y.Z). Defaults to the pushed tag ref.'
+        required: false
+        type: string
+        default: ''
+      releases_repo:
+        description: "'owner/name' hosting the release assets. Empty = this repo."
+        required: false
+        type: string
+        default: ''
+      arches:
+        description: >-
+          Comma-separated architectures (subset of: x86_64, aarch64). Each
+          needs a matching .rpm on the release; a missing one is dropped with a
+          warning. The COPR project must have chroots enabled for each.
+        required: false
+        type: string
+        default: 'x86_64,aarch64'
+      wait:
+        description: 'Block until the COPR build finishes (can take a while). Default: submit and return the build URL.'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Render, build the SRPM and test-build it, but do not submit to COPR'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      COPR_API_CONFIG:
+        description: >-
+          The full copr-cli config file ([copr-cli] section with login,
+          username, token, copr_url) from https://copr.fedorainfracloud.org/api/.
+          Absent = validate-only, with a warning.
+        required: false
+      RELEASES_TOKEN:
+        description: 'Fine-grained PAT with Contents:Read on releases_repo, when that repo is private'
+        required: false
+
+jobs:
+  copr:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve release
+        id: rel
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASES_REPO: ${{ inputs.releases_repo }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::'$TAG' is not a semver release tag — pass the tag input explicitly when not running on a tag push"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Mirrors release.yml's RPM filename scheme (prerelease '-' → '~').
+          echo "rpm_version=${VERSION//-/\~}" >> "$GITHUB_OUTPUT"
+          echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Install rpm tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Collect .rpm assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ steps.rel.outputs.repo }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          RPM_VERSION: ${{ steps.rel.outputs.rpm_version }}
+          PRODUCT: ${{ inputs.product_name }}
+          ARCHES: ${{ inputs.arches }}
+        run: |
+          set -euo pipefail
+          SOURCES="${RUNNER_TEMP}/sources"
+          mkdir -p "$SOURCES"
+          ARCH_LIST=$(printf '%s' "$ARCHES" | tr -d '[:space:]' | tr ',' ' ')
+          AVAILABLE=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          FOUND=""
+          : > "${SOURCES}/assets.env"
+          for ARCH in $ARCH_LIST; do
+            case "$ARCH" in
+              x86_64|aarch64) ;;
+              *) echo "::error::Unsupported architecture '$ARCH' (allowed: x86_64, aarch64)"; exit 1 ;;
+            esac
+            ASSET="${PRODUCT}-${RPM_VERSION}-1.${ARCH}.rpm"
+            if ! printf '%s\n' "$AVAILABLE" | grep -qx -- "$ASSET"; then
+              echo "::warning::No ${ASSET} on ${REPO}@${TAG} — dropping ${ARCH} from the COPR package"
+              continue
+            fi
+            gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir "$SOURCES" --clobber
+            echo "ASSET_${ARCH}=${ASSET}" >> "${SOURCES}/assets.env"
+            FOUND="${FOUND} ${ARCH}"
+            echo "${ARCH}: ${ASSET}"
+          done
+          FOUND=$(printf '%s' "$FOUND" | sed 's/^ //')
+          if [ -z "$FOUND" ]; then
+            echo "::error::No .rpm assets found on ${REPO}@${TAG} for any requested architecture. Add 'rpm' to the release pipeline's formats input."
+            exit 1
+          fi
+          echo "arches=$FOUND" >> "$GITHUB_OUTPUT"
+          echo "dir=$SOURCES" >> "$GITHUB_OUTPUT"
+
+      # Every header field is read from the released RPM: the spec describes
+      # exactly what nfpm.yaml declared, and a version bump upstream is the
+      # only thing that ever changes here.
+      - name: Render the spec
+        id: spec
+        env:
+          SOURCES: ${{ steps.assets.outputs.dir }}
+          FOUND_ARCHES: ${{ steps.assets.outputs.arches }}
+          REPO: ${{ steps.rel.outputs.repo }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . "${SOURCES}/assets.env"
+          FIRST_ARCH=${FOUND_ARCHES%% *}
+          eval "FIRST_RPM=\${SOURCES}/\${ASSET_${FIRST_ARCH}}"
+          q() { rpm -qp --qf "$1" "$FIRST_RPM" 2>/dev/null; }
+          NAME=$(q '%{NAME}')
+          VERSION=$(q '%{VERSION}')
+          RELEASE=$(q '%{RELEASE}')
+          SUMMARY=$(q '%{SUMMARY}')
+          LICENSE=$(q '%{LICENSE}')
+          URL=$(q '%{URL}')
+          DESCRIPTION=$(q '%{DESCRIPTION}')
+          # rpmlib(...) entries are RPM-feature markers, not packages, and
+          # nfpm adds /bin/sh for its scriptlets, which are not carried over.
+          REQUIRES=$(rpm -qp --requires "$FIRST_RPM" 2>/dev/null | grep -vE '^(rpmlib\(|/bin/sh|/usr/bin/sh)' || true)
+          [ -n "$NAME" ] || { echo "::error::Could not read package headers from ${FIRST_RPM}"; exit 1; }
+          [ "${URL:-(none)}" != "(none)" ] || URL="https://github.com/${REPO}"
+          [ "${LICENSE:-(none)}" != "(none)" ] || LICENSE="Unknown"
+
+          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+          WORK="${RUNNER_TEMP}/copr"
+          mkdir -p "$WORK"
+          SPEC="${WORK}/${NAME}.spec"
+          {
+            printf '# Generated by linux-release-kit from the released %s RPM. Edits here are overwritten on the next release.\n' "$NAME"
+            printf '%%global debug_package %%{nil}\n'
+            printf '%%global __strip /bin/true\n\n'
+            printf 'Name:           %s\n' "$NAME"
+            printf 'Version:        %s\n' "$VERSION"
+            printf 'Release:        %s\n' "$RELEASE"
+            printf 'Summary:        %s\n' "$SUMMARY"
+            printf 'License:        %s\n' "$LICENSE"
+            printf 'URL:            %s\n' "$URL"
+            printf 'ExclusiveArch:  %s\n' "$FOUND_ARCHES"
+            i=0
+            for ARCH in $FOUND_ARCHES; do
+              eval "ASSET=\${ASSET_${ARCH}}"
+              printf 'Source%d:        %s/%s\n' "$i" "$BASE_URL" "$ASSET"
+              i=$((i + 1))
+            done
+            printf 'BuildRequires:  cpio\n'
+            printf 'AutoReqProv:    no\n'
+            if [ -n "$REQUIRES" ]; then
+              printf '%s\n' "$REQUIRES" | sed 's/^/Requires:       /'
+            fi
+            printf '\n%%description\n%s\n\n' "$DESCRIPTION"
+            printf '%%prep\n# Nothing to unpack: the payload is the released binary package.\n\n'
+            printf '%%build\n\n'
+            printf '%%install\n'
+            printf 'case "%%{_arch}" in\n'
+            i=0
+            for ARCH in $FOUND_ARCHES; do
+              printf '  %s) SRC="%%{SOURCE%d}" ;;\n' "$ARCH" "$i"
+              i=$((i + 1))
+            done
+            printf '  *) echo "no payload for %%{_arch}"; exit 1 ;;\n'
+            printf 'esac\n'
+            printf 'mkdir -p %%{buildroot}\n'
+            printf '( cd %%{buildroot} && rpm2cpio "$SRC" | cpio -idmu --quiet )\n'
+            # The file list is whatever the payload contains — generated at
+            # install time so the spec never hardcodes paths that nfpm.yaml
+            # may change.
+            printf '( cd %%{buildroot} && find . \\( -type f -o -type l \\) -printf "/%%%%P\\n" ) > %%{_builddir}/%%{name}.files\n\n'
+            printf '%%files -f %%{_builddir}/%%{name}.files\n\n'
+            printf '%%changelog\n'
+            printf '* %s release-kit <releases@users.noreply.github.com> - %s-%s\n' "$(date -u '+%a %b %d %Y')" "$VERSION" "$RELEASE"
+            printf -- '- Automated repack of the upstream %s release\n' "$TAG"
+          } > "$SPEC"
+          echo "--- ${NAME}.spec ---"
+          cat "$SPEC"
+          echo "path=$SPEC" >> "$GITHUB_OUTPUT"
+          echo "workdir=$WORK" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # Build the SRPM in a real Fedora, then prove the spec actually produces
+      # a binary RPM from it (x86_64, the runner's own arch) — a %files or
+      # %install mistake must surface here, not in a failed COPR build an
+      # hour later. rpmlint is advisory: it dislikes prebuilt payloads on
+      # principle, and its rules shift between releases.
+      - name: Build and test the SRPM in a Fedora container
+        id: srpm
+        env:
+          WORK: ${{ steps.spec.outputs.workdir }}
+          SOURCES: ${{ steps.assets.outputs.dir }}
+          SPEC: ${{ steps.spec.outputs.path }}
+          FOUND_ARCHES: ${{ steps.assets.outputs.arches }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${WORK}:/work" -v "${SOURCES}:/sources" -e FOUND_ARCHES="$FOUND_ARCHES" \
+            fedora:latest bash -euo pipefail -c '
+              dnf install -y -q rpm-build rpmlint cpio >/dev/null
+              mkdir -p /work/rpmbuild/{SRPMS,RPMS,BUILD,BUILDROOT}
+              SPEC=$(ls /work/*.spec)
+              rpmbuild -bs --define "_topdir /work/rpmbuild" --define "_sourcedir /sources" "$SPEC"
+              SRPM=$(ls /work/rpmbuild/SRPMS/*.src.rpm)
+              echo "built $(basename "$SRPM")"
+              rpmlint "$SPEC" || echo "::warning::rpmlint reported issues with the spec (above)"
+              case " $FOUND_ARCHES " in *" x86_64 "*)
+                rpmbuild -bb --define "_topdir /work/rpmbuild" --define "_sourcedir /sources" "$SPEC"
+                RPM=$(ls /work/rpmbuild/RPMS/x86_64/*.rpm)
+                echo "--- rebuilt $(basename "$RPM") ---"
+                rpm -qlp "$RPM"
+                rpm -qp --requires "$RPM"
+              ;; esac
+              cp "$SRPM" /work/
+            '
+          SRPM=$(ls "${WORK}"/*.src.rpm)
+          echo "path=$SRPM" >> "$GITHUB_OUTPUT"
+
+      - name: Submit to COPR
+        if: ${{ !inputs.dry_run }}
+        env:
+          COPR_API_CONFIG: ${{ secrets.COPR_API_CONFIG }}
+          PROJECT: ${{ inputs.copr_project }}
+          SRPM: ${{ steps.srpm.outputs.path }}
+          WAIT: ${{ inputs.wait }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COPR_API_CONFIG:-}" ]; then
+            echo "::warning::COPR_API_CONFIG not set — the SRPM was rendered and test-built but not submitted. Paste the config from https://copr.fedorainfracloud.org/api/ into the secret to publish."
+            exit 0
+          fi
+          if ! printf '%s' "$COPR_API_CONFIG" | grep -q '^\[copr-cli\]'; then
+            echo "::error::COPR_API_CONFIG does not look like a copr-cli config file (expected a [copr-cli] section with login/username/token)"
+            exit 1
+          fi
+          mkdir -p ~/.config && printf '%s\n' "$COPR_API_CONFIG" > ~/.config/copr && chmod 600 ~/.config/copr
+          pipx install copr-cli >/dev/null
+          ARGS=()
+          [ "$WAIT" = "true" ] || ARGS+=(--nowait)
+          copr-cli build "${ARGS[@]}" "$PROJECT" "$SRPM" | tee "${RUNNER_TEMP}/copr.log"
+          BUILD_URL=$(grep -oE 'https://copr\.fedorainfracloud\.org/coprs/build/[0-9]+' "${RUNNER_TEMP}/copr.log" | head -1 || true)
+          echo "::notice::Submitted $(basename "$SRPM") to COPR ${PROJECT}${BUILD_URL:+ — $BUILD_URL}"
+
+      - name: Upload the spec and SRPM as a workflow artifact
+        if: always() && steps.spec.outputs.workdir != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: copr-${{ steps.spec.outputs.name }}
+          path: |
+            ${{ steps.spec.outputs.path }}
+            ${{ steps.spec.outputs.workdir }}/*.src.rpm
+          if-no-files-found: warn
+          retention-days: 30

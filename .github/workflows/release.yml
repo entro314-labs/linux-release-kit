@@ -1,0 +1,947 @@
+# Reusable Linux release workflow for any compiled desktop app: native
+# x86_64 + aarch64 legs on a pinned glibc baseline, .deb + .rpm via nfpm,
+# AppImage via linuxdeploy, one GPG key signing the AppImage + the RPM + a
+# SHA256SUMS manifest, changelog guard, pre-publish verification, and
+# cross-repo publishing to a public releases mirror.
+#
+# The sibling tauri-release-kit owns Tauri apps (its bundler emits these same
+# formats). This kit is for everything else — iced, COSMIC, egui, GTK-rs,
+# C, Go, anything that produces one ELF binary plus a .desktop file and an
+# icon. The build step is yours (`build_command`); packaging, signing,
+# verification and publishing are the kit's.
+#
+# Conventions this workflow assumes about the calling repo:
+#   - CHANGELOG.md with a `## [X.Y.Z...]` heading per released tag
+#   - an nfpm config (default packaging/linux/nfpm.yaml) that reads the
+#     RK_* variables this workflow exports — see templates/nfpm.yaml
+#   - a .desktop file and a PNG icon for the AppImage (defaults:
+#     packaging/linux/<product_name>.desktop and .png)
+#   - for Rust apps (rust: true, the default): a cargo project at the repo
+#     root whose release profile builds `target/<triple>/release/<binary>`;
+#     a rust-toolchain.toml is honored if present
+#
+# THE GLIBC RULE: every leg builds on ubuntu-22.04 by default (runner_x86_64 /
+# runner_aarch64). glibc is forward-compatible only — a binary built on a
+# newer image dies on older distros with "GLIBC_2.xx not found", and the
+# AppImage does NOT bundle glibc. Raise the baseline deliberately, never by
+# following `ubuntu-latest`. Flatpak and Snap are exempt (they ship their own
+# runtime), which is why those workflows run on newer images.
+#
+# SIGNING is optional and degrades gracefully: no LINUX_GPG_PRIVATE_KEY ships
+# unsigned artifacts with a notice (nothing on Linux refuses to run them). A
+# key that is PRESENT but fails to sign is a hard failure — appimagetool
+# otherwise emits a byte-identical *unsigned* AppImage and exits 0.
+#
+# PRIVATE app repos MUST set `releases_repo` to a PUBLIC repo + provide
+# RELEASES_TOKEN: private-repo release assets 404 for unauthenticated users,
+# and the AUR/COPR/Flatpak workflows downstream all download them anonymously.
+#
+# RESUMABLE: a run for a tag that already has a DRAFT release reuses that
+# draft, so a partially failed release is retried via workflow_dispatch with
+# `build_targets` set to just the failed leg — the other leg's assets are kept.
+
+name: Linux release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_display_name:
+        description: 'Human name used in release titles, e.g. "MyApp"'
+        required: true
+        type: string
+      product_name:
+        description: >-
+          Filename stem of every asset (<product>_<version>_amd64.deb,
+          <product>-<version>-1.x86_64.rpm, <product>_<version>_x86_64.AppImage).
+          Lowercase, no spaces — the AUR/COPR/Flatpak workflows match on it.
+        required: true
+        type: string
+      binary_name:
+        description: 'Executable name the build produces. Defaults to product_name.'
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: 'Tag to release (vX.Y.Z[-suffix]); defaults to the pushed tag ref'
+        required: false
+        type: string
+        default: ''
+      releases_repo:
+        description: >-
+          'owner/name' of the repo that hosts the GitHub releases. Empty = this
+          repo. REQUIRED (with the RELEASES_TOKEN secret) when the app repo is
+          private — private release assets 404 anonymously.
+        required: false
+        type: string
+        default: ''
+      targets:
+        description: >-
+          Comma-separated platform set the app SHIPS (subset of: linux-x86_64,
+          linux-aarch64). Drives the build matrix and release verification.
+        required: false
+        type: string
+        default: 'linux-x86_64,linux-aarch64'
+      build_targets:
+        description: >-
+          Comma-separated subset of `targets` to BUILD in this run. Empty =
+          all. Retry lever: re-dispatch with the SAME tag and only the failed
+          leg — the run reuses the draft and its already-uploaded assets.
+        required: false
+        type: string
+        default: ''
+      formats:
+        description: >-
+          Comma-separated package formats (subset of: deb, rpm, appimage).
+          deb is what the Flatpak, AUR and Snap workflows repack; rpm is what
+          COPR repacks. Every listed format must be produced on every leg.
+        required: false
+        type: string
+        default: 'deb,rpm,appimage'
+      build_command:
+        description: >-
+          Shell command that builds the binary for the current leg. Runs with
+          RK_TARGET (Rust triple), RK_ARCH (x86_64|aarch64), RK_DEB_ARCH
+          (amd64|arm64), RK_RPM_ARCH, RK_VERSION (bare semver), RK_TAG,
+          RK_BINARY and RK_PRODUCT exported. Defaults to a cargo release
+          build for RK_TARGET.
+        required: false
+        type: string
+        default: 'cargo build --release --locked --target "$RK_TARGET"'
+      binary_path:
+        description: >-
+          Where build_command leaves the binary; the RK_* variables are
+          expanded. Default: target/$RK_TARGET/release/$RK_BINARY
+        required: false
+        type: string
+        default: 'target/$RK_TARGET/release/$RK_BINARY'
+      rust:
+        description: >-
+          Install the Rust toolchain (honoring rust-toolchain.toml) with the
+          leg's target, cache the cargo workspace, and run the fmt + clippy
+          gates before building. Set false for non-Rust apps.
+        required: false
+        type: boolean
+        default: true
+      rust_gates:
+        description: 'With rust: true, fail the leg on `cargo fmt --check` or `cargo clippy -D warnings` before building.'
+        required: false
+        type: boolean
+        default: true
+      rust_workspace_dir:
+        description: 'Directory holding Cargo.lock + target/ (for the cargo cache). Default: repo root.'
+        required: false
+        type: string
+        default: '.'
+      apt_packages:
+        description: >-
+          Space-separated extra apt packages the BUILD needs (-dev headers,
+          e.g. libgtk-4-dev libxkbcommon-dev). Runtime dependencies belong in
+          nfpm.yaml, not here.
+        required: false
+        type: string
+        default: ''
+      nfpm_config:
+        description: 'Path to the nfpm config used for deb + rpm. See templates/nfpm.yaml.'
+        required: false
+        type: string
+        default: 'packaging/linux/nfpm.yaml'
+      nfpm_version:
+        description: "nfpm release to install (e.g. 'v2.43.0'). Empty = latest."
+        required: false
+        type: string
+        default: ''
+      desktop_file:
+        description: '.desktop entry for the AppImage. Default: packaging/linux/<product_name>.desktop'
+        required: false
+        type: string
+        default: ''
+      icon:
+        description: >-
+          PNG icon for the AppImage (256x256 recommended). Its basename
+          (without .png) must equal the desktop file's Icon= key. Default:
+          packaging/linux/<product_name>.png
+        required: false
+        type: string
+        default: ''
+      metainfo:
+        description: >-
+          Optional AppStream MetaInfo XML, installed into the AppImage at
+          usr/share/metainfo/. (deb/rpm take theirs from nfpm.yaml.)
+        required: false
+        type: string
+        default: ''
+      appimage_extra_args:
+        description: >-
+          Extra linuxdeploy arguments, e.g. '--plugin gtk' (after installing
+          the plugin in build_command) or additional '-l /path/lib.so'.
+        required: false
+        type: string
+        default: ''
+      runner_x86_64:
+        description: 'Runner label for the x86_64 leg. This IS the glibc baseline — see the header.'
+        required: false
+        type: string
+        default: 'ubuntu-22.04'
+      runner_aarch64:
+        description: 'Runner label for the aarch64 leg (GitHub-hosted ARM runners are free on public repos).'
+        required: false
+        type: string
+        default: 'ubuntu-22.04-arm'
+    secrets:
+      RELEASES_TOKEN:
+        description: >-
+          Fine-grained PAT with Contents:RW on releases_repo. Required when
+          releases_repo is set (the default GITHUB_TOKEN cannot write
+          cross-repo); ignored otherwise.
+        required: false
+      LINUX_GPG_PRIVATE_KEY:
+        description: >-
+          ASCII-armored private key (or its base64) that signs the AppImage
+          (embedded, via appimagetool), the RPM (rpmsign) and SHA256SUMS
+          (detached .asc). Unset = unsigned artifacts.
+        required: false
+      LINUX_GPG_PASSPHRASE:
+        description: 'Passphrase for LINUX_GPG_PRIVATE_KEY. REQUIRED in CI when the key has one — gpg would otherwise block on a TTY prompt that never comes.'
+        required: false
+      LINUX_GPG_KEY_ID:
+        description: 'Key ID/fingerprint to sign with. Defaults to the first secret key in the imported keyring.'
+        required: false
+
+jobs:
+  # Fail fast on a cheap runner: no CHANGELOG entry for the tag, or a missing
+  # cross-repo token, means no matrix spin-up.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolved.outputs.VERSION }}
+      bare: ${{ steps.resolved.outputs.BARE }}
+      prerelease: ${{ steps.resolved.outputs.PRERELEASE }}
+      releases_owner: ${{ steps.relrepo.outputs.OWNER }}
+      releases_name: ${{ steps.relrepo.outputs.NAME }}
+      signing: ${{ steps.signing.outputs.SIGNING }}
+    env:
+      INPUT_TAG: ${{ inputs.tag }}
+      RELEASES_REPO: ${{ inputs.releases_repo }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: resolved
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            VERSION="$INPUT_TAG"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Version '$VERSION' is not a valid semver tag (expected vX.Y.Z[-suffix])"
+            exit 1
+          fi
+          BARE="${VERSION#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "BARE=$BARE" >> "$GITHUB_OUTPUT"
+          # Any semver suffix marks a GitHub prerelease; there are no update
+          # channels to derive here, that is a store's job.
+          case "$BARE" in
+            *-*) echo "PRERELEASE=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "PRERELEASE=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Resolve releases repo
+        id: relrepo
+        run: |
+          REPO="${RELEASES_REPO:-$GITHUB_REPOSITORY}"
+          echo "OWNER=${REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "NAME=${REPO##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight - RELEASES_TOKEN present when cross-repo
+        if: inputs.releases_repo != ''
+        env:
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          if [ -z "${RELEASES_TOKEN:-}" ]; then
+            echo "::error::releases_repo is set but the RELEASES_TOKEN secret is missing — create a fine-grained PAT with Contents:RW on ${RELEASES_REPO}"
+            exit 1
+          fi
+          echo "RELEASES_TOKEN present."
+
+      # Secrets are invisible to `if:` expressions in later jobs, so the
+      # signing decision is taken once here and passed around as an output.
+      - name: Detect signing configuration
+        id: signing
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "${LINUX_GPG_PRIVATE_KEY:-}" ]; then
+            echo "SIGNING=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "SIGNING=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No LINUX_GPG_PRIVATE_KEY — this release ships unsigned artifacts (checksums only)."
+          fi
+
+      - name: Verify CHANGELOG entry exists
+        env:
+          VERSION: ${{ steps.resolved.outputs.VERSION }}
+          BARE: ${{ steps.resolved.outputs.BARE }}
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::warning::CHANGELOG.md not present — skipping changelog guard"
+            exit 0
+          fi
+          if ! grep -E "^#{1,2} +\[?(${VERSION}|${BARE})\]?" CHANGELOG.md >/dev/null; then
+            echo "::error::CHANGELOG.md has no entry for ${VERSION} (or ${BARE}). Add one before tagging."
+            exit 1
+          fi
+          echo "Found CHANGELOG entry for ${VERSION}."
+
+  # Resolve which legs the app ships (`targets`) and which THIS run builds
+  # (`build_targets`). Splitting the two is what makes a failed release
+  # resumable.
+  plan:
+    needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.MATRIX }}
+      targets: ${{ steps.plan.outputs.TARGETS }}
+      formats: ${{ steps.plan.outputs.FORMATS }}
+    env:
+      TARGETS: ${{ inputs.targets }}
+      BUILD_TARGETS: ${{ inputs.build_targets }}
+      FORMATS: ${{ inputs.formats }}
+      RUNNER_X86_64: ${{ inputs.runner_x86_64 }}
+      RUNNER_AARCH64: ${{ inputs.runner_aarch64 }}
+    steps:
+      - name: Compute build matrix
+        id: plan
+        run: |
+          set -euo pipefail
+          # One leg per platform key. Each leg builds NATIVELY on its own
+          # architecture: linuxdeploy cannot cross-build AppImages, and a
+          # native build sidesteps the whole cross-sysroot/pkg-config dance.
+          LEGS=$(jq -cn --arg x "$RUNNER_X86_64" --arg a "$RUNNER_AARCH64" '{
+            "linux-x86_64":  {"runner":$x,"target":"x86_64-unknown-linux-gnu", "arch":"x86_64", "deb_arch":"amd64","rpm_arch":"x86_64"},
+            "linux-aarch64": {"runner":$a,"target":"aarch64-unknown-linux-gnu","arch":"aarch64","deb_arch":"arm64","rpm_arch":"aarch64"}
+          }')
+          norm() { printf '%s' "$1" | tr -d '[:space:]' | tr ',' '\n' | sed '/^$/d' | awk '!seen[$0]++'; }
+          TARGET_LIST=$(norm "$TARGETS")
+          [ -n "$TARGET_LIST" ] || { echo "::error::targets input resolved to an empty set"; exit 1; }
+          BUILD_LIST=$(norm "${BUILD_TARGETS:-}")
+          [ -n "$BUILD_LIST" ] || BUILD_LIST="$TARGET_LIST"
+          for t in $TARGET_LIST; do
+            printf '%s' "$LEGS" | jq -e --arg t "$t" 'has($t)' >/dev/null \
+              || { echo "::error::Unknown target '$t' in targets input (allowed: linux-x86_64, linux-aarch64)"; exit 1; }
+          done
+          for t in $BUILD_LIST; do
+            printf '%s\n' $TARGET_LIST | grep -qx -- "$t" \
+              || { echo "::error::build_targets entry '$t' is not in this app's targets set"; exit 1; }
+          done
+          FORMAT_LIST=$(norm "$FORMATS")
+          [ -n "$FORMAT_LIST" ] || { echo "::error::formats input resolved to an empty set"; exit 1; }
+          for f in $FORMAT_LIST; do
+            printf '%s\n' deb rpm appimage | grep -qx -- "$f" \
+              || { echo "::error::Unknown format '$f' (allowed: deb, rpm, appimage)"; exit 1; }
+          done
+          FORMATS_CSV=$(printf '%s\n' $FORMAT_LIST | paste -sd, -)
+          MATRIX=$(printf '%s\n' $BUILD_LIST | jq -cRn --argjson legs "$LEGS" --arg fm "$FORMATS_CSV" \
+            '{include: [inputs | $legs[.] + {formats: $fm}]}')
+          echo "MATRIX=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "TARGETS=$(printf '%s\n' $TARGET_LIST | paste -sd, -)" >> "$GITHUB_OUTPUT"
+          echo "FORMATS=$FORMATS_CSV" >> "$GITHUB_OUTPUT"
+          echo "Building: $(printf '%s\n' $BUILD_LIST | paste -sd, -) (shipping set: $(printf '%s\n' $TARGET_LIST | paste -sd, -)); formats: $FORMATS_CSV"
+
+  create-release:
+    needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The release body IS the tag's CHANGELOG section — it is what users read
+      # on the release page and what the stores' "what's new" pulls from.
+      - name: Extract changelog section for release body
+        id: notes
+        env:
+          BARE: ${{ needs.preflight.outputs.bare }}
+        run: |
+          BODY_FILE="$RUNNER_TEMP/release-notes.md"
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="$BARE" '
+              /^## \[/ {
+                if (found) exit
+                if (index($0, "[" ver "]") > 0) { found=1; next }
+              }
+              found { print }
+            ' CHANGELOG.md | sed -e '/./,$!d' > "$BODY_FILE"
+          fi
+          if [ ! -s "${BODY_FILE:-/dev/null}" ]; then
+            echo "No CHANGELOG section found for $BARE — using fallback body" >&2
+            printf 'See the changelog in the repository for details on this release.\n' > "$BODY_FILE"
+          fi
+          echo "file=$BODY_FILE" >> "$GITHUB_OUTPUT"
+
+      # FIND-or-create: a retry dispatch for the same tag must land on the
+      # SAME draft so the other leg's assets are kept. Drafts are invisible to
+      # getReleaseByTag, so scan the list. A PUBLISHED release for the tag is
+      # a hard error — never silently overwrite what users already downloaded.
+      - name: Create or reuse draft release
+        id: create-release
+        uses: actions/github-script@v9
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          APP_NAME: ${{ inputs.app_display_name }}
+          REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
+          REL_NAME: ${{ needs.preflight.outputs.releases_name }}
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
+        with:
+          github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const { readFileSync } = require('node:fs');
+            const { VERSION, PRERELEASE, APP_NAME, REL_OWNER, REL_NAME, NOTES_FILE } = process.env;
+            const body = readFileSync(NOTES_FILE, 'utf8').trim();
+            const prerelease = PRERELEASE === 'true';
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: REL_OWNER, repo: REL_NAME, per_page: 100,
+            });
+            const existing = releases.find((r) => r.tag_name === VERSION);
+            if (existing && !existing.draft) {
+              core.setFailed(`A published release for ${VERSION} already exists on ${REL_OWNER}/${REL_NAME} — bump the version (or delete that release) instead of re-releasing the tag.`);
+              return;
+            }
+            if (existing) {
+              core.info(`Reusing draft release ${existing.id} for ${VERSION} (retry run) — refreshing title/notes.`);
+              await github.rest.repos.updateRelease({
+                owner: REL_OWNER, repo: REL_NAME, release_id: existing.id,
+                tag_name: VERSION, name: `${APP_NAME} ${VERSION}`, body,
+                draft: true, prerelease,
+              });
+              return existing.id;
+            }
+            const { data } = await github.rest.repos.createRelease({
+              owner: REL_OWNER, repo: REL_NAME, tag_name: VERSION,
+              name: `${APP_NAME} ${VERSION}`, body, draft: true, prerelease,
+            });
+            return data.id;
+
+  build:
+    needs: [preflight, plan, create-release]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Exported for build_command, binary_path and nfpm.yaml alike. nfpm
+      # expands ${VAR} in its config, so one variable set serves both.
+      RK_TARGET: ${{ matrix.target }}
+      RK_ARCH: ${{ matrix.arch }}
+      RK_DEB_ARCH: ${{ matrix.deb_arch }}
+      RK_RPM_ARCH: ${{ matrix.rpm_arch }}
+      RK_VERSION: ${{ needs.preflight.outputs.bare }}
+      RK_TAG: ${{ needs.preflight.outputs.version }}
+      RK_PRODUCT: ${{ inputs.product_name }}
+      RK_BINARY: ${{ inputs.binary_name != '' && inputs.binary_name || inputs.product_name }}
+      FORMATS: ${{ matrix.formats }}
+      DIST: ${{ github.workspace }}/.release-kit/dist
+    steps:
+      - uses: actions/checkout@v7
+
+      # Plain apt-get, NOT a caching action: on a real release's arm64 leg a
+      # cache action reported "installing 12 packages... done" while
+      # installing ZERO, and the build died ten minutes later. A release must
+      # fail loudly at the install step.
+      #   libfuse2 — linuxdeploy is itself an AppImage and needs FUSE2 to run
+      #     (libfuse2t64 on 24.04 images, should the baseline be raised)
+      #   rpm — rpmsign + signature verification; nfpm writes RPMs itself
+      #   gettext-base — envsubst for binary_path
+      #   desktop-file-utils — validates the .desktop before it ships
+      #   file — asserts the binary is really the leg's architecture
+      - name: Install packaging dependencies
+        env:
+          APT_PACKAGES: ${{ inputs.apt_packages }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rpm gettext-base desktop-file-utils file $APT_PACKAGES
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
+
+      - name: Setup Rust
+        if: inputs.rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust workspace
+        if: inputs.rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.rust_workspace_dir }}
+          shared-key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      # Gates before the expensive part, same reasoning as the sibling kits:
+      # a lint failure should cost seconds, not a build.
+      - name: Rust format + clippy gates
+        if: inputs.rust && inputs.rust_gates
+        working-directory: ${{ inputs.rust_workspace_dir }}
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --release --locked --target "$RK_TARGET" -- -D warnings
+
+      # Linux artifact signing. One GPG key signs the AppImage (embedded, via
+      # appimagetool's SIGN env), the RPM (rpmsign) and — in the checksums job
+      # — SHA256SUMS. The .deb stays unsigned: apt verifies repository
+      # metadata, not packages, and a standalone .deb has no signature check
+      # to satisfy.
+      - name: Import Linux signing key
+        id: linux_sign
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+          LINUX_GPG_KEY_ID: ${{ secrets.LINUX_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LINUX_GPG_PRIVATE_KEY:-}" ]; then
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY_FILE="${RUNNER_TEMP}/linux-signing.asc"
+          # Accept the armored key directly or base64-wrapped (people reach for
+          # base64 even though the secrets UI preserves the armor).
+          if printf '%s' "$LINUX_GPG_PRIVATE_KEY" | grep -q 'BEGIN PGP PRIVATE KEY'; then
+            printf '%s\n' "$LINUX_GPG_PRIVATE_KEY" > "$KEY_FILE"
+          elif printf '%s' "$LINUX_GPG_PRIVATE_KEY" | base64 --decode 2>/dev/null | grep -q 'BEGIN PGP PRIVATE KEY'; then
+            printf '%s' "$LINUX_GPG_PRIVATE_KEY" | base64 --decode > "$KEY_FILE"
+          else
+            echo "::error::LINUX_GPG_PRIVATE_KEY is neither an ASCII-armored private key nor base64 of one. Export it with 'gpg --armor --export-secret-keys <KEY_ID>'."
+            exit 1
+          fi
+          chmod 600 "$KEY_FILE"
+
+          # Loopback pinentry: without it gpg blocks forever on a passphrase
+          # dialog no CI runner can answer. Preset-passphrase lets rpmsign —
+          # which drives gpg itself and offers no --passphrase — sign too.
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          printf 'allow-loopback-pinentry\nallow-preset-passphrase\n' >> ~/.gnupg/gpg-agent.conf
+          echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf
+          gpgconf --kill gpg-agent || true
+
+          if [ -n "${LINUX_GPG_PASSPHRASE:-}" ]; then
+            gpg --batch --yes --passphrase "$LINUX_GPG_PASSPHRASE" --import "$KEY_FILE"
+          else
+            gpg --batch --yes --import "$KEY_FILE"
+          fi
+          rm -f "$KEY_FILE"
+
+          KEY_ID="${LINUX_GPG_KEY_ID:-}"
+          if [ -z "$KEY_ID" ]; then
+            KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')
+          fi
+          if [ -z "$KEY_ID" ]; then
+            echo "::error::No secret key present after import — the key material did not load"
+            exit 1
+          fi
+          # Ultimate ownertrust, or gpg refuses to sign non-interactively.
+          printf '%s:6:\n' "$KEY_ID" | gpg --batch --import-ownertrust
+
+          if [ -n "${LINUX_GPG_PASSPHRASE:-}" ]; then
+            for grip in $(gpg --batch --with-colons --with-keygrip --list-secret-keys "$KEY_ID" | awk -F: '/^grp:/ { print $10 }'); do
+              /usr/lib/gnupg/gpg-preset-passphrase --preset --passphrase "$LINUX_GPG_PASSPHRASE" "$grip"
+            done
+          fi
+
+          # Prove the key can sign NOW, before anything is built: a wrong
+          # passphrase or a sign-incapable subkey must not surface as a
+          # cryptic appimagetool failure after the compile.
+          if ! printf 'probe' | gpg --batch --yes -u "$KEY_ID" --armor --detach-sign > /dev/null; then
+            echo "::error::The imported key ${KEY_ID} cannot sign — wrong LINUX_GPG_PASSPHRASE, or the key has no signing capability"
+            exit 1
+          fi
+
+          {
+            echo "SIGN=1"
+            echo "SIGN_KEY=${KEY_ID}"
+            # Fail the AppImage when signing fails instead of shipping an
+            # unsigned one that looks identical to a signed one.
+            echo "APPIMAGETOOL_FORCE_SIGN=1"
+            if [ -n "${LINUX_GPG_PASSPHRASE:-}" ]; then
+              echo "APPIMAGETOOL_SIGN_PASSPHRASE=${LINUX_GPG_PASSPHRASE}"
+            fi
+          } >> "$GITHUB_ENV"
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "key_id=${KEY_ID}" >> "$GITHUB_OUTPUT"
+          echo "Linux signing key ${KEY_ID} imported (AppImage + RPM + SHA256SUMS)."
+
+      - name: Build
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: |
+          set -euo pipefail
+          echo "Building ${RK_PRODUCT} ${RK_VERSION} for ${RK_TARGET}"
+          bash -euo pipefail -c "$BUILD_COMMAND"
+
+      # Three assertions that each catch a real class of silent failure: the
+      # path is wrong (build_command wrote somewhere else), the file is not
+      # executable (a script left it 644), or it is the WRONG architecture
+      # (a cargo invocation that ignored --target builds for the host, which
+      # only differs from the leg when someone later cross-builds).
+      - name: Locate the built binary
+        id: binary
+        env:
+          BINARY_PATH: ${{ inputs.binary_path }}
+        run: |
+          set -euo pipefail
+          BIN=$(printf '%s' "$BINARY_PATH" | envsubst)
+          if [ ! -f "$BIN" ]; then
+            echo "::error::No binary at '${BIN}' (from binary_path='${BINARY_PATH}') after build_command ran"
+            exit 1
+          fi
+          [ -x "$BIN" ] || chmod +x "$BIN"
+          DESC=$(file -b "$BIN")
+          case "$RK_ARCH" in
+            x86_64)  printf '%s' "$DESC" | grep -q 'x86-64' ;;
+            aarch64) printf '%s' "$DESC" | grep -qi 'aarch64' ;;
+          esac || {
+            echo "::error::${BIN} is not a ${RK_ARCH} ELF binary: ${DESC}"
+            exit 1
+          }
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "RK_BINARY_PATH=$BIN" >> "$GITHUB_ENV"
+          mkdir -p "$DIST"
+          echo "${DESC}"
+
+      - name: Resolve packaging assets
+        id: assets
+        env:
+          DESKTOP_FILE: ${{ inputs.desktop_file }}
+          ICON: ${{ inputs.icon }}
+          METAINFO: ${{ inputs.metainfo }}
+          NFPM_CONFIG: ${{ inputs.nfpm_config }}
+        run: |
+          set -euo pipefail
+          DESKTOP="${DESKTOP_FILE:-packaging/linux/${RK_PRODUCT}.desktop}"
+          ICON_PATH="${ICON:-packaging/linux/${RK_PRODUCT}.png}"
+          case ",$FORMATS," in
+            *,appimage,*)
+              [ -f "$DESKTOP" ]   || { echo "::error::AppImage needs a .desktop file; none at '${DESKTOP}' (desktop_file input)"; exit 1; }
+              [ -f "$ICON_PATH" ] || { echo "::error::AppImage needs a PNG icon; none at '${ICON_PATH}' (icon input)"; exit 1; }
+              # A broken desktop file makes linuxdeploy fail late and
+              # cryptically; validate it here where the message is readable.
+              desktop-file-validate "$DESKTOP"
+              ICON_KEY=$(sed -n 's/^Icon=//p' "$DESKTOP" | head -1)
+              ICON_BASE=$(basename "$ICON_PATH" .png)
+              if [ "$ICON_KEY" != "$ICON_BASE" ]; then
+                echo "::error::The desktop file's Icon=${ICON_KEY} does not match the icon file name '${ICON_BASE}' — linuxdeploy requires them to agree"
+                exit 1
+              fi
+              ;;
+          esac
+          case ",$FORMATS," in
+            *,deb,*|*,rpm,*)
+              [ -f "$NFPM_CONFIG" ] || { echo "::error::deb/rpm need an nfpm config; none at '${NFPM_CONFIG}' (nfpm_config input). Start from templates/nfpm.yaml."; exit 1; }
+              ;;
+          esac
+          if [ -n "${METAINFO:-}" ] && [ ! -f "$METAINFO" ]; then
+            echo "::error::metainfo input points at '${METAINFO}', which does not exist"
+            exit 1
+          fi
+          echo "desktop=$DESKTOP" >> "$GITHUB_OUTPUT"
+          echo "icon=$ICON_PATH" >> "$GITHUB_OUTPUT"
+          echo "metainfo=${METAINFO:-}" >> "$GITHUB_OUTPUT"
+          echo "nfpm=$NFPM_CONFIG" >> "$GITHUB_OUTPUT"
+
+      # nfpm writes deb AND rpm from one config, with per-packager overrides
+      # for the names that differ (a Fedora `Requires:` is not a Debian
+      # `Depends:`). Installed from its GitHub release for the leg's
+      # architecture — the apt repo lags and `go install` needs a toolchain.
+      - name: Install nfpm
+        if: contains(matrix.formats, 'deb') || contains(matrix.formats, 'rpm')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NFPM_VERSION: ${{ inputs.nfpm_version }}
+        run: |
+          set -euo pipefail
+          gh release download ${NFPM_VERSION:+"$NFPM_VERSION"} --repo goreleaser/nfpm \
+            --pattern "nfpm_*_${RK_DEB_ARCH}.deb" --dir "$RUNNER_TEMP" --clobber
+          sudo dpkg -i "$RUNNER_TEMP"/nfpm_*_"${RK_DEB_ARCH}".deb
+          nfpm --version
+
+      - name: Package .deb
+        if: contains(matrix.formats, 'deb')
+        env:
+          NFPM_CONFIG: ${{ steps.assets.outputs.nfpm }}
+        run: |
+          set -euo pipefail
+          OUT="${DIST}/${RK_PRODUCT}_${RK_VERSION}_${RK_DEB_ARCH}.deb"
+          nfpm package --config "$NFPM_CONFIG" --packager deb --target "$OUT"
+          echo "--- $(basename "$OUT") ---"
+          dpkg-deb --info "$OUT"
+          dpkg-deb --contents "$OUT"
+          # The Flatpak/AUR/Snap workflows repack this file and need an
+          # executable under usr/bin plus a .desktop entry; fail here rather
+          # than in three downstream jobs.
+          dpkg-deb --contents "$OUT" | grep -qE ' \./usr/bin/[^/ ]+$' \
+            || { echo "::error::The .deb installs nothing under /usr/bin — check the contents: block of ${NFPM_CONFIG}"; exit 1; }
+          dpkg-deb --contents "$OUT" | grep -q '/usr/share/applications/.*\.desktop$' \
+            || echo "::warning::The .deb ships no .desktop file — the app will not appear in launchers, and the Flatpak/Snap repacks will fail"
+
+      - name: Package .rpm
+        if: contains(matrix.formats, 'rpm')
+        env:
+          NFPM_CONFIG: ${{ steps.assets.outputs.nfpm }}
+          SIGNING: ${{ steps.linux_sign.outputs.signing }}
+          KEY_ID: ${{ steps.linux_sign.outputs.key_id }}
+        run: |
+          set -euo pipefail
+          # RPM forbids '-' in Version; nfpm moves a semver prerelease into
+          # the Release field itself. The FILENAME mirrors that with the
+          # tilde form RPM sorts correctly (1.0.0~beta.1 < 1.0.0).
+          RPM_VERSION="${RK_VERSION//-/\~}"
+          OUT="${DIST}/${RK_PRODUCT}-${RPM_VERSION}-1.${RK_RPM_ARCH}.rpm"
+          nfpm package --config "$NFPM_CONFIG" --packager rpm --target "$OUT"
+          if [ "$SIGNING" = "true" ]; then
+            rpmsign --define "_gpg_name ${KEY_ID}" --addsign "$OUT"
+            gpg --armor --export "$KEY_ID" > "${RUNNER_TEMP}/RPM-GPG-KEY"
+            sudo rpm --import "${RUNNER_TEMP}/RPM-GPG-KEY"
+            # We ran rpmsign ourselves, so a signature that does not verify
+            # against our own key is a pipeline bug — hard error.
+            rpm -K "$OUT" | grep -qi 'signatures OK' \
+              || { echo "::error::$(basename "$OUT") did not verify against ${KEY_ID}: $(rpm -K "$OUT" 2>&1)"; exit 1; }
+            echo "RPM signed + verified against ${KEY_ID}."
+          fi
+          echo "--- $(basename "$OUT") ---"
+          rpm -qip "$OUT"
+          rpm -qlp "$OUT"
+
+      # linuxdeploy assembles the AppDir (binary, .desktop, icon, AppRun) and
+      # bundles every shared library the binary links except the blacklisted
+      # base-system set (glibc, libGL, …) — which is exactly why the runner
+      # baseline matters: the glibc the AppImage expects is the runner's.
+      - name: Package AppImage
+        if: contains(matrix.formats, 'appimage')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BIN: ${{ steps.binary.outputs.path }}
+          DESKTOP: ${{ steps.assets.outputs.desktop }}
+          ICON: ${{ steps.assets.outputs.icon }}
+          METAINFO: ${{ steps.assets.outputs.metainfo }}
+          EXTRA_ARGS: ${{ inputs.appimage_extra_args }}
+          SIGNING: ${{ steps.linux_sign.outputs.signing }}
+          KEY_ID: ${{ steps.linux_sign.outputs.key_id }}
+          # linuxdeploy's strip pass breaks against newer binutils (seen on
+          # the ubuntu-24.04 images: "failed to run linuxdeploy" with FUSE
+          # installed). The binary is already stripped by the release profile;
+          # leaving bundled libs unstripped costs a few MB and nothing else.
+          NO_STRIP: 'true'
+        run: |
+          set -euo pipefail
+          TOOLS="${RUNNER_TEMP}/linuxdeploy"
+          mkdir -p "$TOOLS"
+          gh release download continuous --repo linuxdeploy/linuxdeploy \
+            --pattern "linuxdeploy-${RK_ARCH}.AppImage" --dir "$TOOLS" --clobber
+          chmod +x "${TOOLS}/linuxdeploy-${RK_ARCH}.AppImage"
+
+          APPDIR="${RUNNER_TEMP}/AppDir"
+          rm -rf "$APPDIR"
+          if [ -n "${METAINFO:-}" ]; then
+            install -Dm644 "$METAINFO" "${APPDIR}/usr/share/metainfo/$(basename "$METAINFO")"
+          fi
+
+          # `VERSION` names the output; ARCH tells appimagetool what it is
+          # building when it cannot infer it. OUTPUT pins the filename to the
+          # scheme every downstream workflow expects.
+          export VERSION="$RK_VERSION" ARCH="$RK_ARCH"
+          export OUTPUT="${DIST}/${RK_PRODUCT}_${RK_VERSION}_${RK_ARCH}.AppImage"
+          # shellcheck disable=SC2086
+          "${TOOLS}/linuxdeploy-${RK_ARCH}.AppImage" \
+            --appdir "$APPDIR" \
+            --executable "$BIN" \
+            --desktop-file "$DESKTOP" \
+            --icon-file "$ICON" \
+            $EXTRA_ARGS \
+            --output appimage
+          [ -f "$OUTPUT" ] || { echo "::error::linuxdeploy exited 0 but ${OUTPUT} does not exist"; exit 1; }
+          chmod +x "$OUTPUT"
+          ls -lh "$OUTPUT"
+
+          if [ "$SIGNING" = "true" ]; then
+            # APPIMAGETOOL_FORCE_SIGN already failed the build on a signing
+            # error; this catches signing that "succeeded" against nothing.
+            # Advisory: AppImage never validates its own signature at run time.
+            if "$OUTPUT" --appimage-signature 2>/dev/null | grep -q 'PGP SIGNATURE'; then
+              echo "AppImage carries an embedded signature (key ${KEY_ID})."
+            else
+              echo "::warning::$(basename "$OUTPUT") has no readable embedded signature. Publish the key fingerprint ${KEY_ID} over TLS so users can check it with the AppImage validate tool."
+            fi
+          fi
+
+      # --clobber so a retry of this leg replaces its own assets instead of
+      # 422-ing; assets from the OTHER leg are untouched. gh resolves a draft
+      # release by tag_name, which is what lets this upload before publish.
+      - name: Upload assets to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ needs.preflight.outputs.releases_owner }}/${{ needs.preflight.outputs.releases_name }}
+        run: |
+          set -euo pipefail
+          ls -l "$DIST"
+          gh release upload "$RK_TAG" "$DIST"/* --repo "$REPO" --clobber
+          echo "Uploaded $(find "$DIST" -type f | wc -l) asset(s) for ${RK_TARGET} to ${REPO}@${RK_TAG}"
+
+  # One SHA256SUMS over every artifact on the draft (both legs, including
+  # ones a previous attempt uploaded), GPG-signed when a key is present. This
+  # is the only integrity check a standalone .deb gets, and what the AUR and
+  # COPR recipes pin their checksums against.
+  checksums:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Import signing key
+        id: sign
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+          LINUX_GPG_KEY_ID: ${{ secrets.LINUX_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LINUX_GPG_PRIVATE_KEY:-}" ]; then
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KEY_FILE="${RUNNER_TEMP}/linux-signing.asc"
+          if printf '%s' "$LINUX_GPG_PRIVATE_KEY" | grep -q 'BEGIN PGP PRIVATE KEY'; then
+            printf '%s\n' "$LINUX_GPG_PRIVATE_KEY" > "$KEY_FILE"
+          else
+            printf '%s' "$LINUX_GPG_PRIVATE_KEY" | base64 --decode > "$KEY_FILE"
+          fi
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf
+          echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf
+          gpgconf --kill gpg-agent || true
+          gpg --batch --yes ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} --import "$KEY_FILE"
+          rm -f "$KEY_FILE"
+          KEY_ID="${LINUX_GPG_KEY_ID:-$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')}"
+          printf '%s:6:\n' "$KEY_ID" | gpg --batch --import-ownertrust
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Generate, sign and upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ needs.preflight.outputs.releases_owner }}/${{ needs.preflight.outputs.releases_name }}
+          TAG: ${{ needs.preflight.outputs.version }}
+          SIGNING: ${{ steps.sign.outputs.signing }}
+          KEY_ID: ${{ steps.sign.outputs.key_id }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          WORK="${RUNNER_TEMP}/sums"
+          mkdir -p "$WORK" && cd "$WORK"
+          gh release download "$TAG" --repo "$REPO" --dir . --clobber
+          # A retry run's draft already carries the previous attempt's sums.
+          rm -f SHA256SUMS SHA256SUMS.asc ./*.asc
+          set -- *
+          [ -e "$1" ] || { echo "::error::No assets on ${REPO}@${TAG} to checksum"; exit 1; }
+          sha256sum -- "$@" > SHA256SUMS
+          cat SHA256SUMS
+          UPLOAD="SHA256SUMS"
+          if [ "$SIGNING" = "true" ]; then
+            gpg --batch --yes -u "$KEY_ID" ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} \
+              --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+            gpg --verify SHA256SUMS.asc SHA256SUMS
+            # Also publish the public key next to the artifacts so `rpm
+            # --import` and `gpg --verify` instructions can point at a URL
+            # that moves with the release.
+            gpg --armor --export "$KEY_ID" > "${KEY_ID}.asc"
+            UPLOAD="SHA256SUMS SHA256SUMS.asc ${KEY_ID}.asc"
+          fi
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" $UPLOAD --repo "$REPO" --clobber
+
+  # Fail loud BEFORE the draft flips public: every format for every SHIPPED
+  # target (not just this run's build set) must be on the release, plus the
+  # checksums — and their signature when signing is configured.
+  verify-release:
+    needs: [preflight, plan, create-release, build, checksums]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify release assets (via API)
+        uses: actions/github-script@v9
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
+          REL_NAME: ${{ needs.preflight.outputs.releases_name }}
+          BARE: ${{ needs.preflight.outputs.bare }}
+          PRODUCT: ${{ inputs.product_name }}
+          TARGETS: ${{ needs.plan.outputs.targets }}
+          FORMATS: ${{ needs.plan.outputs.formats }}
+          SIGNING: ${{ needs.preflight.outputs.signing }}
+        with:
+          github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const { RELEASE_ID, REL_OWNER, REL_NAME, BARE, PRODUCT, TARGETS, FORMATS, SIGNING } = process.env;
+            const { data: release } = await github.rest.repos.getRelease({
+              owner: REL_OWNER, repo: REL_NAME, release_id: Number(RELEASE_ID),
+            });
+            const names = new Set(release.assets.map((a) => a.name));
+            const legs = {
+              'linux-x86_64':  { arch: 'x86_64',  deb: 'amd64', rpm: 'x86_64' },
+              'linux-aarch64': { arch: 'aarch64', deb: 'arm64', rpm: 'aarch64' },
+            };
+            const rpmVersion = BARE.replace(/-/g, '~');
+            const expected = [];
+            for (const t of TARGETS.split(',')) {
+              const leg = legs[t];
+              for (const f of FORMATS.split(',')) {
+                if (f === 'deb') expected.push(`${PRODUCT}_${BARE}_${leg.deb}.deb`);
+                if (f === 'rpm') expected.push(`${PRODUCT}-${rpmVersion}-1.${leg.rpm}.rpm`);
+                if (f === 'appimage') expected.push(`${PRODUCT}_${BARE}_${leg.arch}.AppImage`);
+              }
+            }
+            expected.push('SHA256SUMS');
+            if (SIGNING === 'true') expected.push('SHA256SUMS.asc');
+            const missing = expected.filter((n) => !names.has(n));
+            if (missing.length) {
+              core.setFailed(`Release ${release.tag_name} is missing expected assets:\n  - ${missing.join('\n  - ')}\nPresent: ${[...names].join(', ')}`);
+              return;
+            }
+            core.info(`Verified ${expected.length} expected assets on ${REL_OWNER}/${REL_NAME} release ${release.tag_name}.`);
+
+  publish-release:
+    needs: [preflight, plan, create-release, verify-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        uses: actions/github-script@v9
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
+          REL_NAME: ${{ needs.preflight.outputs.releases_name }}
+        with:
+          github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: process.env.REL_OWNER, repo: process.env.REL_NAME,
+              release_id: Number(process.env.RELEASE_ID), draft: false,
+            });
+
+      # Now that the release is public, SHA256SUMS must resolve for an
+      # UNAUTHENTICATED client — that is what every user, AUR helper and COPR
+      # builder is. This can only pass when the releases repo is PUBLIC.
+      - name: Smoke-test public download URL
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
+          REL_NAME: ${{ needs.preflight.outputs.releases_name }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/${REL_OWNER}/${REL_NAME}/releases/download/${VERSION}/SHA256SUMS"
+          CODE=000
+          for attempt in 1 2 3; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L -A release-verify "$URL") && [ "$CODE" = "200" ] && break
+            sleep 10
+          done
+          [ "$CODE" = "200" ] || { echo "::error::SHA256SUMS not publicly reachable: HTTP $CODE $URL — is ${REL_OWNER}/${REL_NAME} public?"; exit 1; }
+          echo "::notice::Published ${VERSION}: https://github.com/${REL_OWNER}/${REL_NAME}/releases/tag/${VERSION}"

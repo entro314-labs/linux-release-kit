@@ -1,0 +1,24 @@
+[Desktop Entry]
+# Copy to packaging/linux/<product_name>.desktop. Validate with
+# `desktop-file-validate`; the release workflow runs the same check.
+Type=Application
+Name=MyApp
+GenericName=Short generic name
+Comment=One-line description shown in launchers
+# Bare executable name — the packages install it on PATH. Do not hardcode
+# /usr/bin: Flatpak and Snap relocate it.
+Exec=myapp %U
+# Icon name WITHOUT extension; must equal the icon file's basename
+# (packaging/linux/myapp.png → Icon=myapp). The Flatpak workflow rewrites it
+# to the app id, the snap template to an absolute ${SNAP} path.
+Icon=myapp
+Terminal=false
+# Pick from the freedesktop main categories:
+# https://specifications.freedesktop.org/menu-spec/latest/apa.html
+Categories=Utility;
+Keywords=keyword1;keyword2;
+StartupNotify=true
+# Wayland: the compositor matches windows to this entry by app id. Set it to
+# whatever your toolkit reports (often the binary name, or the reverse-DNS
+# id for GTK4/libadwaita apps).
+StartupWMClass=myapp

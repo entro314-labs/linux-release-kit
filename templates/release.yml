@@ -1,0 +1,147 @@
+# Thin caller for the shared Linux release pipeline.
+# Copy to .github/workflows/release.yml in your app repo and fill in the
+# inputs. Full consumer checklist: linux-release-kit README.
+#
+# Pin the kit to a reviewed commit SHA rather than @main — the workflow runs
+# with contents:write and your signing key; see the README's "Pinning" note.
+#
+# The `release` job is the pipeline. The jobs after it are OPTIONAL
+# distribution channels chained with `needs: release` so they run against a
+# published release — DELETE the ones you do not ship. Each one also skips
+# itself with a warning when its credentials are absent, so leaving one in
+# place while you set its secrets up is safe.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0, v1.0.0-beta.1)'
+        required: true
+        type: string
+      build_targets:
+        description: >-
+          Only build these legs (comma-separated, e.g. "linux-aarch64").
+          Empty = all. Retry lever: after a partially failed release,
+          re-dispatch with the SAME tag and just the failed leg — the other
+          leg's assets are already on the draft.
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: entro314-labs/linux-release-kit/.github/workflows/release.yml@main
+    permissions:
+      contents: write
+    with:
+      app_display_name: 'MyApp'        # ← release titles: "MyApp v1.0.0"
+      product_name: 'myapp'            # ← asset filename stem; lowercase, no spaces
+      tag: ${{ inputs.tag || '' }}
+      build_targets: ${{ inputs.build_targets || '' }}
+      # --- Build (defaults shown = a Rust app at the repo root). For a
+      #     non-Rust app set rust: false and your own build_command.
+      # rust: true
+      # build_command: 'cargo build --release --locked --target "$RK_TARGET"'
+      # binary_path: 'target/$RK_TARGET/release/$RK_BINARY'
+      # apt_packages: 'libgtk-4-dev libxkbcommon-dev'   # ← BUILD deps only
+      # --- Packaging inputs (defaults shown)
+      # nfpm_config: 'packaging/linux/nfpm.yaml'
+      # desktop_file: 'packaging/linux/myapp.desktop'
+      # icon: 'packaging/linux/myapp.png'
+      # metainfo: 'packaging/linux/com.example.MyApp.metainfo.xml'
+      # --- Shipped platform set + formats (optional; defaults shown)
+      # targets: 'linux-x86_64,linux-aarch64'
+      # formats: 'deb,rpm,appimage'
+      # --- glibc baseline (optional). ubuntu-22.04 = glibc 2.35. Raise it
+      #     deliberately; never point these at ubuntu-latest.
+      # runner_x86_64: 'ubuntu-22.04'
+      # runner_aarch64: 'ubuntu-22.04-arm'
+      # --- Cross-repo publishing (REQUIRED for private app repos: private
+      #     release assets 404 anonymously, and the AUR/COPR/Flatpak recipes
+      #     download them anonymously). Needs the RELEASES_TOKEN secret.
+      #     Omit for public single-repo apps.
+      releases_repo: 'my-org/myapp-releases'
+    secrets: inherit
+
+  # --- OPTIONAL: Flatpak. Repacks the released .deb into a Flatpak bundle,
+  #     attaches it to the release, and emits a Flathub-ready manifest as a
+  #     workflow artifact. DELETE this job if you don't ship a Flatpak.
+  flatpak:
+    needs: release
+    uses: entro314-labs/linux-release-kit/.github/workflows/flatpak.yml@main
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.tag || '' }}
+      releases_repo: 'my-org/myapp-releases'
+      app_id: 'com.example.MyApp'      # ← MUST equal the <id> in your metainfo
+      product_name: 'myapp'
+      arches: 'x86_64'                 # ← add aarch64 once you ship an arm64 .deb
+      # metainfo: 'packaging/linux/com.example.MyApp.metainfo.xml'  # ← required for Flathub
+      # runtime: 'org.gnome.Platform'  # ← GTK apps; default is org.freedesktop.Platform
+      # sdk: 'org.gnome.Sdk'
+      # runtime_version: '48'
+      # tray_icon: true                # ← only if the app has a tray icon
+    secrets: inherit
+
+  # --- OPTIONAL: Arch User Repository. Publishes a `-bin` package built from
+  #     the released .deb. Needs the AUR_SSH_PRIVATE_KEY secret; without it the
+  #     PKGBUILD is still rendered and validated, just not pushed.
+  #     DELETE this job if you don't publish to the AUR.
+  aur:
+    needs: release
+    uses: entro314-labs/linux-release-kit/.github/workflows/aur.yml@main
+    with:
+      tag: ${{ inputs.tag || '' }}
+      releases_repo: 'my-org/myapp-releases'
+      pkgname: 'myapp-bin'             # ← the `-bin` suffix is required by Arch
+      product_name: 'myapp'
+      pkgdesc: 'One-line app description'
+      url: 'https://example.com'
+      license: 'MIT'
+      depends: 'gtk4'                  # ← Arch names of what the binary links (ldd)
+      maintainer: 'Your Name <you@example.com>'
+      provides: 'myapp'
+      conflicts: 'myapp'
+      # dry_run: true                  # ← validate without publishing
+    secrets: inherit
+
+  # --- OPTIONAL: Fedora COPR. Repacks the released .rpm into an SRPM and
+  #     submits it to your COPR project. Needs the COPR_API_CONFIG secret;
+  #     without it the SRPM is still built and test-built, just not submitted.
+  #     DELETE this job if you don't publish to COPR.
+  copr:
+    needs: release
+    uses: entro314-labs/linux-release-kit/.github/workflows/copr.yml@main
+    with:
+      tag: ${{ inputs.tag || '' }}
+      releases_repo: 'my-org/myapp-releases'
+      copr_project: 'your-fas-user/myapp'
+      product_name: 'myapp'
+      # dry_run: true                  # ← validate without submitting
+    secrets: inherit
+
+  # --- OPTIONAL: Snap Store. Repacks the released .deb via snap/snapcraft.yaml
+  #     (see templates/snapcraft.yaml), smoke-installs it and uploads it when
+  #     SNAPCRAFT_STORE_CREDENTIALS is set. DELETE this job if you don't ship a
+  #     snap.
+  snap:
+    needs: release
+    uses: entro314-labs/linux-release-kit/.github/workflows/snap.yml@main
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.tag || '' }}
+      releases_repo: 'my-org/myapp-releases'
+      product_name: 'myapp'
+      arches: 'x86_64'
+      # store_channel: 'edge'          # ← default: derived from the tag
+    secrets: inherit

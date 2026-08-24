@@ -1,0 +1,80 @@
+# nfpm config for the .deb and .rpm — one file, two packagers.
+# Copy to packaging/linux/nfpm.yaml (or point the release workflow's
+# nfpm_config input at it). Reference: https://nfpm.goreleaser.com/configuration/
+#
+# The RK_* variables are exported by the release workflow for the leg being
+# built; nfpm expands ${VAR} itself. You never edit the version here.
+#   RK_VERSION      bare semver from the tag (1.2.3 or 1.2.3-beta.1 — nfpm
+#                   splits the prerelease into the form each packager wants)
+#   RK_DEB_ARCH     amd64 | arm64 (nfpm's arch field uses Go names and maps
+#                   them to x86_64/aarch64 for rpm itself)
+#   RK_BINARY_PATH  the binary the build produced for this leg
+
+name: myapp
+arch: ${RK_DEB_ARCH}
+platform: linux
+version: ${RK_VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Your Name <you@example.com>
+vendor: Your Org
+homepage: https://example.com
+license: MIT
+description: |
+  One paragraph shown by apt/dnf. The first line is the short description;
+  keep it under 80 characters.
+
+# Runtime dependencies differ per distro, so declare them per packager. Use
+# `ldd target/<triple>/release/myapp` to see what the binary actually links;
+# an iced/wgpu/egui app often needs nothing beyond the base system, a GTK
+# app needs the toolkit.
+overrides:
+  deb:
+    depends:
+      - libgtk-4-1
+  rpm:
+    depends:
+      - gtk4
+
+contents:
+  - src: ${RK_BINARY_PATH}
+    dst: /usr/bin/myapp
+    file_info:
+      mode: 0755
+
+  # Launcher entry + icon. The same two files feed the AppImage (desktop_file
+  # and icon inputs); the Flatpak/AUR/Snap workflows repack them from here.
+  - src: packaging/linux/myapp.desktop
+    dst: /usr/share/applications/myapp.desktop
+  - src: packaging/linux/myapp.png
+    dst: /usr/share/icons/hicolor/256x256/apps/myapp.png
+  # Optional: a full hicolor tree (16x16 … 512x512, scalable/) — see the
+  # README's icon notes. `type: tree` copies the directory recursively.
+  # - src: packaging/linux/icons/
+  #   dst: /usr/share/icons/hicolor/
+  #   type: tree
+
+  # AppStream MetaInfo: what GNOME Software / KDE Discover show. Required
+  # for Flathub anyway, so ship it in the native packages too.
+  - src: packaging/linux/com.example.MyApp.metainfo.xml
+    dst: /usr/share/metainfo/com.example.MyApp.metainfo.xml
+
+  - src: LICENSE
+    dst: /usr/share/doc/myapp/copyright
+    type: doc
+
+# Optional maintainer scripts (the AUR and COPR repacks do not carry these
+# over; Arch's .install and Fedora's file triggers refresh caches instead).
+# scripts:
+#   postinstall: packaging/linux/postinstall.sh
+#   postremove: packaging/linux/postremove.sh
+
+deb:
+  fields:
+    Bugs: https://github.com/my-org/myapp/issues
+
+rpm:
+  summary: One-line summary for the RPM header
+  # Signing is done by the release workflow with rpmsign — do not set
+  # rpm.signature here, it would need the key on disk at package time.

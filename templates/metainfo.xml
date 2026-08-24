@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream MetaInfo. Ships in the .deb/.rpm (nfpm.yaml), the AppImage
+  (metainfo input) and the Flatpak; Flathub REQUIRES it and validates it —
+  the placeholder the flatpak workflow falls back to will not pass review.
+
+  Rename to packaging/linux/<your.app.id>.metainfo.xml, fill everything in,
+  and validate locally with appstreamcli's "validate" command (offline flag).
+-->
+<component type="desktop-application">
+  <!-- MUST equal the flatpak workflow's app_id. -->
+  <id>com.example.MyApp</id>
+  <launchable type="desktop-id">com.example.MyApp.desktop</launchable>
+
+  <name>MyApp</name>
+  <summary>One short line, no trailing period, under 35 characters</summary>
+
+  <developer id="com.example">
+    <name>Your Name</name>
+  </developer>
+
+  <!-- metadata_license covers THIS file; project_license covers the app.
+       Use LicenseRef-proprietary for a closed-source app. -->
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      A paragraph or two describing what the app does. This is what users read
+      in GNOME Software and KDE Discover.
+    </p>
+  </description>
+
+  <!-- Flathub requires at least one screenshot, served over HTTPS. -->
+  <screenshots>
+    <screenshot type="default">
+      <image>https://example.com/screenshots/main.png</image>
+      <caption>The main window</caption>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://example.com</url>
+  <url type="bugtracker">https://github.com/my-org/myapp/issues</url>
+
+  <!-- Required. Fill in honestly; an OARS rating with no elements is valid
+       for an app with no objectionable content. -->
+  <content_rating type="oars-1.1"/>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <recommends>
+    <display_length compare="ge">768</display_length>
+  </recommends>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#dceffd</color>
+    <color type="primary" scheme_preference="dark">#123a5c</color>
+  </branding>
+
+  <!-- Software centres show this as the "What's New" text. The marker comment
+       lets release-kit rewrite the version AND the date on every release, so
+       this cannot drift: list this file in "versionFiles". The description is
+       still yours to write — release-kit's changelog step is a good source. -->
+  <releases>
+    <release version="1.0.0" date="2026-01-01"> <!-- x-release-kit-version-date -->
+      <description>
+        <ul>
+          <li>First release</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+
+  <update_contact>you@example.com</update_contact>
+</component>
