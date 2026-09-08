@@ -708,19 +708,26 @@ jobs:
           nfpm package --config "$NFPM_CONFIG" --packager deb --target "$OUT"
           echo "--- $(basename "$OUT") ---"
           dpkg-deb --info "$OUT"
-          dpkg-deb --contents "$OUT"
+          # Listed once into a variable, and every check below matches against
+          # that rather than piping into `grep -q`. `grep -q` exits at the
+          # first match; dpkg-deb then takes SIGPIPE writing the rest of the
+          # listing, and `pipefail` reports the whole pipeline as failed — so
+          # a package that DOES contain the path fails the check looking for
+          # it, and only once the listing is long enough for the race to land.
+          CONTENTS="$(dpkg-deb --contents "$OUT")"
+          printf '%s\n' "$CONTENTS"
           # The Flatpak/AUR/Snap workflows repack this file and need an
           # executable under usr/bin plus a .desktop entry; fail here rather
           # than in three downstream jobs.
-          dpkg-deb --contents "$OUT" | grep -qE ' \./usr/bin/[^/ ]+$' \
+          grep -qE ' \./usr/bin/[^/ ]+$' <<<"$CONTENTS" \
             || { echo "::error::The .deb installs nothing under /usr/bin — check the contents: block of ${NFPM_CONFIG}"; exit 1; }
-          dpkg-deb --contents "$OUT" | grep -q '/usr/share/applications/.*\.desktop$' \
+          grep -q '/usr/share/applications/.*\.desktop$' <<<"$CONTENTS" \
             || echo "::warning::The .deb ships no .desktop file — the app will not appear in launchers, and the Flatpak/Snap repacks will fail"
           # System caches must never ship in a package: every package would
           # carry its own copy of the same path and they conflict on install.
           # They sneak in when a staging install runs update-desktop-database
           # or gtk-update-icon-cache against the package root.
-          if dpkg-deb --contents "$OUT" | grep -qE '/(icon-theme\.cache|mimeinfo\.cache)$'; then
+          if grep -qE '/(icon-theme\.cache|mimeinfo\.cache)$' <<<"$CONTENTS"; then
             echo "::error::The .deb ships icon-theme.cache/mimeinfo.cache — guard the staging install's cache refreshers on its package-root variable"
             exit 1
           fi
@@ -780,14 +787,17 @@ jobs:
           OUT="${DIST}/${RK_PRODUCT}-${ARCH_PKGVER}-1-${RK_ARCH}.pkg.tar.zst"
           RK_VERSION="$ARCH_PKGVER" nfpm package --config "$NFPM_CONFIG" --packager archlinux --target "$OUT"
           echo "--- $(basename "$OUT") ---"
-          tar -tf "$OUT"
+          # Same SIGPIPE-under-pipefail reason as the .deb step: list once,
+          # match against the variable.
+          CONTENTS="$(tar -tf "$OUT")"
+          printf '%s\n' "$CONTENTS"
           # Same downstream contract as the .deb: an executable under
           # /usr/bin, checked here rather than in the pacman-repo workflow.
-          tar -tf "$OUT" | grep -qE '^usr/bin/[^/]+$' \
+          grep -qE '^usr/bin/[^/]+$' <<<"$CONTENTS" \
             || { echo "::error::The Arch package installs nothing under /usr/bin — check the contents: block of ${NFPM_CONFIG}"; exit 1; }
           # Same cache guard as the .deb step: shipped system caches conflict
           # between packages at install time.
-          if tar -tf "$OUT" | grep -qE '/(icon-theme\.cache|mimeinfo\.cache)$'; then
+          if grep -qE '/(icon-theme\.cache|mimeinfo\.cache)$' <<<"$CONTENTS"; then
             echo "::error::The Arch package ships icon-theme.cache/mimeinfo.cache — guard the staging install's cache refreshers on its package-root variable"
             exit 1
           fi
