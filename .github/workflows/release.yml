@@ -131,7 +131,10 @@ on:
         type: boolean
         default: true
       rust_workspace_dir:
-        description: 'Directory holding Cargo.lock + target/ (for the cargo cache). Default: repo root.'
+        description: >-
+          Directory holding Cargo.lock + target/. The fmt/clippy gates, the
+          cargo cache, build_command and binary_path all run relative to it.
+          Default: repo root.
         required: false
         type: string
         default: '.'
@@ -593,7 +596,11 @@ jobs:
           echo "key_id=${KEY_ID}" >> "$GITHUB_OUTPUT"
           echo "Linux signing key ${KEY_ID} imported (AppImage + RPM + SHA256SUMS)."
 
+      # Same directory as the fmt/clippy gates and the cargo cache: a nested
+      # workspace that passed the gates used to fail here with "could not find
+      # Cargo.toml" because the build ran at the repo root.
       - name: Build
+        working-directory: ${{ inputs.rust_workspace_dir }}
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
         run: |
@@ -608,15 +615,18 @@ jobs:
       # only differs from the leg when someone later cross-builds).
       - name: Locate the built binary
         id: binary
+        working-directory: ${{ inputs.rust_workspace_dir }}
         env:
           BINARY_PATH: ${{ inputs.binary_path }}
         run: |
           set -euo pipefail
           BIN=$(printf '%s' "$BINARY_PATH" | envsubst)
           if [ ! -f "$BIN" ]; then
-            echo "::error::No binary at '${BIN}' (from binary_path='${BINARY_PATH}') after build_command ran"
+            echo "::error::No binary at '${BIN}' (from binary_path='${BINARY_PATH}', relative to rust_workspace_dir) after build_command ran"
             exit 1
           fi
+          # Every later step runs at the repo root, so hand them an absolute path.
+          BIN=$(readlink -f "$BIN")
           [ -x "$BIN" ] || chmod +x "$BIN"
           DESC=$(file -b "$BIN")
           case "$RK_ARCH" in
