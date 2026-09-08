@@ -169,8 +169,13 @@ the baseline from the `.deb`/`.rpm`.
    failed leg (the other leg's assets are already on the draft):
 
    ```bash
-   gh workflow run release.yml -f tag=v0.2.0 -f build_targets=linux-aarch64
+   gh workflow run release.yml --ref v0.2.0 -f tag=v0.2.0 -f build_targets=linux-aarch64
    ```
+
+   `--ref` runs the workflow file as it was at the tag; the pipeline checks the tag out
+   regardless of what was dispatched, so the retried leg is built from the same commit
+   the other leg was. "Re-run failed jobs" on the original run is the other retry path,
+   and the only one once the release is already published.
 
    A release already PUBLISHED for the tag is never reused — the run fails
    loudly; bump the version instead.

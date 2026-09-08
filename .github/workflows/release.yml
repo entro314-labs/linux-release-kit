@@ -227,6 +227,10 @@ jobs:
       RELEASES_REPO: ${{ inputs.releases_repo }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # A dispatch retry names the tag; without this it would build whatever the
+          # default branch is at retry time and attach that beside the tag's assets.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Resolve version
         id: resolved
@@ -288,11 +292,14 @@ jobs:
           BARE: ${{ steps.resolved.outputs.BARE }}
         run: |
           if [ ! -f CHANGELOG.md ]; then
-            echo "::warning::CHANGELOG.md not present — skipping changelog guard"
-            exit 0
+            echo "::error::CHANGELOG.md not present — its ${VERSION} section is the release body. Add one before tagging."
+            exit 1
           fi
-          if ! grep -E "^#{1,2} +\[?(${VERSION}|${BARE})\]?" CHANGELOG.md >/dev/null; then
-            echo "::error::CHANGELOG.md has no entry for ${VERSION} (or ${BARE}). Add one before tagging."
+          # The same heading shape the release-body extractor in create-release reads
+          # (`## [X.Y.Z]`): a looser guard passed headings the extractor cannot find,
+          # and the release then shipped with a placeholder body.
+          if ! grep -E "^## \[(${VERSION}|${BARE})\]" CHANGELOG.md >/dev/null; then
+            echo "::error::CHANGELOG.md has no '## [${BARE}]' heading. Add one before tagging."
             exit 1
           fi
           echo "Found CHANGELOG entry for ${VERSION}."
@@ -359,6 +366,10 @@ jobs:
       release_id: ${{ steps.create-release.outputs.result }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # A dispatch retry names the tag; without this it would build whatever the
+          # default branch is at retry time and attach that beside the tag's assets.
+          ref: ${{ inputs.tag || github.ref }}
 
       # The release body IS the tag's CHANGELOG section — it is what users read
       # on the release page and what the stores' "what's new" pulls from.
@@ -448,6 +459,10 @@ jobs:
       DIST: ${{ github.workspace }}/.release-kit/dist
     steps:
       - uses: actions/checkout@v7
+        with:
+          # A dispatch retry names the tag; without this it would build whatever the
+          # default branch is at retry time and attach that beside the tag's assets.
+          ref: ${{ inputs.tag || github.ref }}
 
       # Plain apt-get, NOT a caching action: on a real release's arm64 leg a
       # cache action reported "installing 12 packages... done" while

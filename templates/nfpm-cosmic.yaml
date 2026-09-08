@@ -20,6 +20,8 @@ name: myapp
 arch: ${RK_DEB_ARCH}
 platform: linux
 version: ${RK_VERSION}
+# Keep at "1": the pipeline names the .rpm and Arch package with a fixed `-1` and
+# checks the Arch .PKGINFO for it, so any other value fails the arch leg.
 release: "1"
 section: utils
 priority: optional
