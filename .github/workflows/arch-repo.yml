@@ -334,14 +334,24 @@ jobs:
               # guard keeps myapp-* from matching a myapp-extra package).
               # The database only references the version repo-add is about to
               # write, so deleting older files never breaks an install.
-              ls "${STAGE}/${ARCH}/" 2>/dev/null \
-                | grep -E "^${PRODUCT}-[0-9][^-]*-[0-9]+-${ARCH}\.pkg\.tar\.zst$" \
-                | grep -vx "${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst" \
-                | sort -V | head -n -"$KEEP" \
-                | while read -r OLD; do
-                    echo "Pruning superseded ${ARCH}/${OLD}"
-                    rm -f "${STAGE}/${ARCH}/${OLD}" "${STAGE}/${ARCH}/${OLD}.sig"
-                  done
+              #
+              # `|| true` because "nothing to prune" is the normal case, not a
+              # failure, and both greps report it as one: on a first release
+              # the only file present IS the current version, so `grep -vx`
+              # excludes everything, exits 1, and `pipefail` takes the whole
+              # job down before repo-add ever runs — silently, since the
+              # pipeline prints nothing on the way out.
+              PRUNE="$(
+                ls "${STAGE}/${ARCH}/" 2>/dev/null \
+                  | grep -E "^${PRODUCT}-[0-9][^-]*-[0-9]+-${ARCH}\.pkg\.tar\.zst$" \
+                  | grep -vx "${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst" \
+                  | sort -V | head -n -"$KEEP" || true
+              )"
+              while read -r OLD; do
+                [ -n "$OLD" ] || continue
+                echo "Pruning superseded ${ARCH}/${OLD}"
+                rm -f "${STAGE}/${ARCH}/${OLD}" "${STAGE}/${ARCH}/${OLD}.sig"
+              done <<<"$PRUNE"
 
               # repo-add appends to / replaces in the EXISTING database, so
               # other apps' entries survive. It runs in a real Arch container
