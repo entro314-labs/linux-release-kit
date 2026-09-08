@@ -691,6 +691,14 @@ jobs:
             || { echo "::error::The .deb installs nothing under /usr/bin — check the contents: block of ${NFPM_CONFIG}"; exit 1; }
           dpkg-deb --contents "$OUT" | grep -q '/usr/share/applications/.*\.desktop$' \
             || echo "::warning::The .deb ships no .desktop file — the app will not appear in launchers, and the Flatpak/Snap repacks will fail"
+          # System caches must never ship in a package: every package would
+          # carry its own copy of the same path and they conflict on install.
+          # They sneak in when a staging install runs update-desktop-database
+          # or gtk-update-icon-cache against the package root.
+          if dpkg-deb --contents "$OUT" | grep -qE '/(icon-theme\.cache|mimeinfo\.cache)$'; then
+            echo "::error::The .deb ships icon-theme.cache/mimeinfo.cache — guard the staging install's cache refreshers on its package-root variable"
+            exit 1
+          fi
 
       - name: Package .rpm
         if: contains(matrix.formats, 'rpm')
@@ -752,6 +760,12 @@ jobs:
           # /usr/bin, checked here rather than in the pacman-repo workflow.
           tar -tf "$OUT" | grep -qE '^usr/bin/[^/]+$' \
             || { echo "::error::The Arch package installs nothing under /usr/bin — check the contents: block of ${NFPM_CONFIG}"; exit 1; }
+          # Same cache guard as the .deb step: shipped system caches conflict
+          # between packages at install time.
+          if tar -tf "$OUT" | grep -qE '/(icon-theme\.cache|mimeinfo\.cache)$'; then
+            echo "::error::The Arch package ships icon-theme.cache/mimeinfo.cache — guard the staging install's cache refreshers on its package-root variable"
+            exit 1
+          fi
           # Prove the prerelease mapping survived nfpm — this is the check
           # that catches a future nfpm changing its version handling.
           PKGVER_IN=$(tar -xOf "$OUT" .PKGINFO | sed -n 's/^pkgver = //p')
