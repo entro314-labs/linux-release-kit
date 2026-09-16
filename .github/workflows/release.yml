@@ -749,11 +749,22 @@ jobs:
           if [ "$SIGNING" = "true" ]; then
             rpmsign --define "_gpg_name ${KEY_ID}" --addsign "$OUT"
             gpg --armor --export "$KEY_ID" > "${RUNNER_TEMP}/RPM-GPG-KEY"
-            sudo rpm --import "${RUNNER_TEMP}/RPM-GPG-KEY"
+            # One explicit keyring database for the import and the check. The
+            # key used to go in with `sudo rpm --import` and the check ran as
+            # the runner user, and Debian's rpm keeps a per-user database by
+            # default — so the check never saw the key and every signed
+            # package failed as "digests SIGNATURES NOT OK".
+            RPMDB="${RUNNER_TEMP}/rpmdb"
+            mkdir -p "$RPMDB"
+            rpmkeys --dbpath "$RPMDB" --import "${RUNNER_TEMP}/RPM-GPG-KEY"
             # We ran rpmsign ourselves, so a signature that does not verify
             # against our own key is a pipeline bug — hard error.
-            rpm -K "$OUT" | grep -qi 'signatures OK' \
-              || { echo "::error::$(basename "$OUT") did not verify against ${KEY_ID}: $(rpm -K "$OUT" 2>&1)"; exit 1; }
+            CHECK="$(rpm --dbpath "$RPMDB" -Kv "$OUT" 2>&1 || true)"
+            if ! rpm --dbpath "$RPMDB" -K "$OUT" | grep -qi 'signatures OK'; then
+              echo "::error::$(basename "$OUT") did not verify against ${KEY_ID}"
+              printf '%s\n' "$CHECK"
+              exit 1
+            fi
             echo "RPM signed + verified against ${KEY_ID}."
           fi
           echo "--- $(basename "$OUT") ---"
