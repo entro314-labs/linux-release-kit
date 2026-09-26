@@ -872,12 +872,34 @@ jobs:
           # installed). The binary is already stripped by the release profile;
           # leaving bundled libs unstripped costs a few MB and nothing else.
           NO_STRIP: 'true'
+          # linuxdeploy is pinned to a dated release and checked against a
+          # sha256, not taken from the moving `continuous` tag: that tag is
+          # rebuilt in place, so an unpinned download changed the AppImage
+          # toolchain between two runs of the same release with no trace.
+          # The linuxdeploy AppImage bundles linuxdeploy-plugin-appimage and
+          # appimagetool, so this one pin covers the whole toolchain; nothing
+          # else is downloaded.
+          # To bump: pick a dated tag from
+          # https://github.com/linuxdeploy/linuxdeploy/releases, then for each
+          # arch run `curl -fsSL https://github.com/linuxdeploy/linuxdeploy/releases/download/<tag>/linuxdeploy-<arch>.AppImage | sha256sum`
+          # and paste the tag and both hashes below (the release page's
+          # "sha256:" digest must agree).
+          LINUXDEPLOY_TAG: '1-alpha-20251107-1'
+          LINUXDEPLOY_SHA256_X86_64: 'c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d'
+          LINUXDEPLOY_SHA256_AARCH64: '620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff'
         run: |
           set -euo pipefail
           TOOLS="${RUNNER_TEMP}/linuxdeploy"
           mkdir -p "$TOOLS"
-          gh release download continuous --repo linuxdeploy/linuxdeploy \
+          case "$RK_ARCH" in
+            x86_64)  LINUXDEPLOY_SHA256="$LINUXDEPLOY_SHA256_X86_64" ;;
+            aarch64) LINUXDEPLOY_SHA256="$LINUXDEPLOY_SHA256_AARCH64" ;;
+            *) echo "::error::No pinned linuxdeploy checksum for ${RK_ARCH}"; exit 1 ;;
+          esac
+          gh release download "$LINUXDEPLOY_TAG" --repo linuxdeploy/linuxdeploy \
             --pattern "linuxdeploy-${RK_ARCH}.AppImage" --dir "$TOOLS" --clobber
+          ( cd "$TOOLS" && printf '%s  %s\n' "$LINUXDEPLOY_SHA256" "linuxdeploy-${RK_ARCH}.AppImage" | sha256sum -c - ) \
+            || { echo "::error::linuxdeploy-${RK_ARCH}.AppImage from ${LINUXDEPLOY_TAG} does not match its pinned sha256 — the release asset changed; re-verify before bumping the pin"; exit 1; }
           chmod +x "${TOOLS}/linuxdeploy-${RK_ARCH}.AppImage"
 
           APPDIR="${RUNNER_TEMP}/AppDir"
