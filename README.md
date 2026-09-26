@@ -180,6 +180,33 @@ the baseline from the `.deb`/`.rpm`.
    A release already PUBLISHED for the tag is never reused — the run fails
    loudly; bump the version instead.
 
+## AppImage self-update (optional)
+
+An AppImage has no package manager behind it; the AppImage update tools
+(AppImageUpdate, `appimageupdatetool`, and launchers such as Gear Lever or
+AppImageLauncher that use them) read update information embedded in the
+file and fetch only the changed blocks via a `.zsync` published next to it.
+Turn it on with:
+
+```yaml
+appimage_update_info: 'gh-releases-zsync|<owner>|<repo>|latest|<product>_*_$RK_ARCH.AppImage.zsync'
+```
+
+- `<owner>|<repo>` is where the assets are **served**: `releases_repo` when
+  set, otherwise the app repo. Preflight fails the run if they disagree —
+  an updater pointed anywhere else silently never finds an update.
+- `$RK_ARCH` is expanded per leg, so one value covers x86_64 and aarch64;
+  the file pattern must match the leg's own `<product>_<ver>_<arch>.AppImage.zsync`
+  or the leg fails.
+- `latest` follows GitHub's latest release, which never points at a
+  prerelease or a draft: installs update to the newest stable release.
+
+Each leg checks that `--appimage-updateinformation` returns exactly the
+configured string, uploads `<product>_<ver>_<arch>.AppImage.zsync` beside the
+AppImage (covered by `SHA256SUMS`), and `verify-release` refuses to publish
+without it. Other forms appimagetool accepts (`zsync|<url>`,
+`pling-v1-zsync|…`) pass through with a notice, unchecked.
+
 ## Smoke test before upload (optional)
 
 `smoke_test: true` makes every build leg exercise its packages on its own
@@ -250,6 +277,7 @@ Every downstream workflow matches on these exact names; they are built from
 | `.rpm` | `<product>-<ver>-1.x86_64.rpm` | `<product>-<ver>-1.aarch64.rpm` |
 | Arch | `<product>-<pkgver>-1-x86_64.pkg.tar.zst` (+ `.sig`) | `<product>-<pkgver>-1-aarch64.pkg.tar.zst` (+ `.sig`) |
 | AppImage | `<product>_<ver>_x86_64.AppImage` | `<product>_<ver>_aarch64.AppImage` |
+| AppImage update (`appimage_update_info` only) | `<product>_<ver>_x86_64.AppImage.zsync` | `<product>_<ver>_aarch64.AppImage.zsync` |
 | Checksums | `SHA256SUMS`, `SHA256SUMS.asc`, `<FPR>.asc` | |
 
 A prerelease `1.0.0-beta.1` keeps its dash in the `.deb`/AppImage names and

@@ -183,6 +183,18 @@ on:
         required: false
         type: string
         default: ''
+      appimage_update_info:
+        description: >-
+          AppImage self-update. Empty = off. Otherwise the update information
+          embedded in the AppImage, normally
+          'gh-releases-zsync|<owner>|<repo>|latest|<product>_*_$RK_ARCH.AppImage.zsync'
+          where <owner>/<repo> is where the release assets are served
+          (releases_repo when set). The RK_* variables are expanded per leg,
+          so one value serves both architectures. The matching .zsync is
+          uploaded next to the AppImage.
+        required: false
+        type: string
+        default: ''
       smoke_test:
         description: >-
           Before uploading, check the packages on each leg's own runner: the
@@ -317,6 +329,34 @@ jobs:
             echo "SIGNING=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No LINUX_GPG_PRIVATE_KEY — this release ships unsigned artifacts (checksums only)."
           fi
+
+      # Checked here, before any build: an updater pointed at a repo that does
+      # not serve the assets never finds an update, and nothing would ever
+      # say so — installed AppImages just stay on this version.
+      - name: Preflight - AppImage update information
+        if: inputs.appimage_update_info != ''
+        env:
+          UPDATE_INFO: ${{ inputs.appimage_update_info }}
+          REL_OWNER: ${{ steps.relrepo.outputs.OWNER }}
+          REL_NAME: ${{ steps.relrepo.outputs.NAME }}
+        run: |
+          set -euo pipefail
+          IFS='|' read -r KIND OWNER NAME _ <<<"$UPDATE_INFO"
+          case "$KIND" in
+            gh-releases-zsync)
+              want="$(printf '%s/%s' "$REL_OWNER" "$REL_NAME" | tr '[:upper:]' '[:lower:]')"
+              got="$(printf '%s/%s' "$OWNER" "$NAME" | tr '[:upper:]' '[:lower:]')"
+              if [ "$got" != "$want" ]; then
+                echo "::error::appimage_update_info points the updater at ${OWNER}/${NAME}, but the release assets (and the .zsync) are served from ${REL_OWNER}/${REL_NAME}"
+                exit 1
+              fi
+              ;;
+            zsync|pling-v1-zsync) echo "::notice::appimage_update_info is a ${KIND} string — make sure it resolves to the .zsync this release uploads." ;;
+            *)
+              echo "::error::appimage_update_info must start with 'gh-releases-zsync|', 'zsync|' or 'pling-v1-zsync|' (the forms appimagetool accepts), got '${KIND}|…'"
+              exit 1
+              ;;
+          esac
 
       - name: Verify CHANGELOG entry exists
         env:
@@ -884,6 +924,7 @@ jobs:
           ICON: ${{ steps.assets.outputs.icon }}
           METAINFO: ${{ steps.assets.outputs.metainfo }}
           EXTRA_ARGS: ${{ inputs.appimage_extra_args }}
+          UPDATE_INFO_TEMPLATE: ${{ inputs.appimage_update_info }}
           SIGNING: ${{ steps.linux_sign.outputs.signing }}
           KEY_ID: ${{ steps.linux_sign.outputs.key_id }}
           # linuxdeploy's strip pass breaks against newer binutils (seen on
@@ -932,6 +973,31 @@ jobs:
           # scheme every downstream workflow expects.
           export VERSION="$RK_VERSION" ARCH="$RK_ARCH"
           export OUTPUT="${DIST}/${RK_PRODUCT}_${RK_VERSION}_${RK_ARCH}.AppImage"
+
+          # AppImage self-update (appimage_update_info). The pinned appimage
+          # plugin reads LDAI_UPDATE_INFORMATION (UPDATE_INFORMATION is its
+          # deprecated alias) and hands it to appimagetool as `-u`, which
+          # embeds it and — only when zsyncmake is on PATH, hence the zsync
+          # package — writes the .zsync the updater fetches. zsyncmake names
+          # it after the AppImage's basename and writes it to the CURRENT
+          # directory, not next to OUTPUT; it is moved into DIST below.
+          UPDATE_INFO=""
+          if [ -n "${UPDATE_INFO_TEMPLATE:-}" ]; then
+            UPDATE_INFO="$(printf '%s' "$UPDATE_INFO_TEMPLATE" | envsubst)"
+            ZSYNC_NAME="$(basename "$OUTPUT").zsync"
+            if [ "${UPDATE_INFO%%|*}" = "gh-releases-zsync" ]; then
+              # The updater picks the .zsync from the latest release by this
+              # glob; one that does not match this leg's file never updates.
+              PATTERN="${UPDATE_INFO##*|}"
+              # shellcheck disable=SC2053 # PATTERN is a glob on purpose
+              [[ "$ZSYNC_NAME" == $PATTERN ]] \
+                || { echo "::error::appimage_update_info's file pattern '${PATTERN}' does not match this leg's ${ZSYNC_NAME} — use <product>_*_\$RK_ARCH.AppImage.zsync"; exit 1; }
+            fi
+            sudo apt-get install -y zsync
+            rm -f "$ZSYNC_NAME" "${OUTPUT}.zsync"
+            export LDAI_UPDATE_INFORMATION="$UPDATE_INFO"
+          fi
+
           # shellcheck disable=SC2086
           "${TOOLS}/linuxdeploy-${RK_ARCH}.AppImage" \
             --appdir "$APPDIR" \
@@ -943,6 +1009,18 @@ jobs:
           [ -f "$OUTPUT" ] || { echo "::error::linuxdeploy exited 0 but ${OUTPUT} does not exist"; exit 1; }
           chmod +x "$OUTPUT"
           ls -lh "$OUTPUT"
+
+          if [ -n "$UPDATE_INFO" ]; then
+            [ ! -f "$ZSYNC_NAME" ] || mv "$ZSYNC_NAME" "${OUTPUT}.zsync"
+            [ -f "${OUTPUT}.zsync" ] \
+              || { echo "::error::appimage_update_info is set but appimagetool wrote no ${ZSYNC_NAME} — installed AppImages would find no update"; exit 1; }
+            EMBEDDED="$("$OUTPUT" --appimage-updateinformation)"
+            if [ "$EMBEDDED" != "$UPDATE_INFO" ]; then
+              echo "::error::$(basename "$OUTPUT") embeds update information '${EMBEDDED}', expected '${UPDATE_INFO}'"
+              exit 1
+            fi
+            echo "Embedded update information: ${EMBEDDED} (+ ${ZSYNC_NAME})"
+          fi
 
           if [ "$SIGNING" = "true" ]; then
             # APPIMAGETOOL_FORCE_SIGN already failed the build on a signing
@@ -1148,10 +1226,11 @@ jobs:
           TARGETS: ${{ needs.plan.outputs.targets }}
           FORMATS: ${{ needs.plan.outputs.formats }}
           SIGNING: ${{ needs.preflight.outputs.signing }}
+          ZSYNC: ${{ inputs.appimage_update_info != '' }}
         with:
           github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
-            const { RELEASE_ID, REL_OWNER, REL_NAME, BARE, PRODUCT, TARGETS, FORMATS, SIGNING } = process.env;
+            const { RELEASE_ID, REL_OWNER, REL_NAME, BARE, PRODUCT, TARGETS, FORMATS, SIGNING, ZSYNC } = process.env;
             const owner = REL_OWNER;
             const repo = REL_NAME;
             const release_id = Number(RELEASE_ID);
@@ -1167,7 +1246,10 @@ jobs:
               for (const f of FORMATS.split(',')) {
                 if (f === 'deb') expected.push(`${PRODUCT}_${BARE}_${leg.deb}.deb`);
                 if (f === 'rpm') expected.push(`${PRODUCT}-${rpmVersion}-1.${leg.rpm}.rpm`);
-                if (f === 'appimage') expected.push(`${PRODUCT}_${BARE}_${leg.arch}.AppImage`);
+                if (f === 'appimage') {
+                  expected.push(`${PRODUCT}_${BARE}_${leg.arch}.AppImage`);
+                  if (ZSYNC === 'true') expected.push(`${PRODUCT}_${BARE}_${leg.arch}.AppImage.zsync`);
+                }
                 if (f === 'arch') {
                   expected.push(`${PRODUCT}-${archPkgver}-1-${leg.arch}.pkg.tar.zst`);
                   if (SIGNING === 'true') expected.push(`${PRODUCT}-${archPkgver}-1-${leg.arch}.pkg.tar.zst.sig`);

@@ -59,6 +59,11 @@ jobs:
       # desktop_file: 'packaging/linux/myapp.desktop'
       # icon: 'packaging/linux/myapp.png'
       # metainfo: 'packaging/linux/com.example.MyApp.metainfo.xml'
+      # --- AppImage self-update (optional): embeds update information and
+      #     uploads a .zsync next to each AppImage. <owner>/<repo> must be
+      #     where the assets are served — releases_repo below when set.
+      #     Keep the single quotes: $RK_ARCH is expanded per leg by the kit.
+      # appimage_update_info: 'gh-releases-zsync|my-org|myapp-releases|latest|myapp_*_$RK_ARCH.AppImage.zsync'
       # --- Launch test before upload (optional): installs the .deb and starts
       #     the AppImage under Xvfb on each leg; the app must still be running
       #     after 15 s. smoke_args are passed to it for that launch.
