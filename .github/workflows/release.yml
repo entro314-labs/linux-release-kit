@@ -673,9 +673,6 @@ jobs:
           {
             echo "SIGN=1"
             echo "SIGN_KEY=${KEY_ID}"
-            # Fail the AppImage when signing fails instead of shipping an
-            # unsigned one that looks identical to a signed one.
-            echo "APPIMAGETOOL_FORCE_SIGN=1"
             if [ -n "${LINUX_GPG_PASSPHRASE:-}" ]; then
               echo "APPIMAGETOOL_SIGN_PASSPHRASE=${LINUX_GPG_PASSPHRASE}"
             fi
@@ -1026,8 +1023,8 @@ jobs:
           fi
 
           if [ "$SIGNING" = "true" ]; then
-            # APPIMAGETOOL_FORCE_SIGN already failed the build on a signing
-            # error; this catches signing that "succeeded" against nothing.
+            # appimagetool already aborts the build when signing fails ("Signing
+            # failed, aborting"); this catches signing that "succeeded" against nothing.
             # Advisory: AppImage never validates its own signature at run time.
             if "$OUTPUT" --appimage-signature 2>/dev/null | grep -q 'PGP SIGNATURE'; then
               echo "AppImage carries an embedded signature (key ${KEY_ID})."

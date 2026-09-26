@@ -87,14 +87,14 @@ platform level, which is what most users actually rely on.
 - **Key present** → the build leg imports it, proves it can sign *before*
   compiling anything (wrong passphrase fails in seconds, not after the
   build), then:
-  - exports `SIGN=1 SIGN_KEY=<FPR> APPIMAGETOOL_FORCE_SIGN=1` for
-    linuxdeploy/appimagetool. `FORCE_SIGN` matters: without it a signing
-    failure produces a byte-identical *unsigned* AppImage and exit 0.
+  - exports `SIGN=1 SIGN_KEY=<FPR>` for linuxdeploy/appimagetool. The
+    appimagetool bundled in the pinned linuxdeploy aborts on a signing
+    failure; the old `APPIMAGETOOL_FORCE_SIGN` switch is no longer read.
   - runs `rpmsign --addsign` on the `.rpm` and verifies it with `rpm -K`
     against the same key — a mismatch is a hard error because the pipeline
     did the signing itself.
   - checks the AppImage with `--appimage-signature` (advisory: a missing
-    signature here is a warning, since `FORCE_SIGN` already failed the
+    signature here is a warning, since appimagetool already failed the
     build on a real signing error).
 - **Checksums job** → downloads every asset on the draft, writes
   `SHA256SUMS`, signs it, verifies the signature, uploads both plus
