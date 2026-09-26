@@ -296,6 +296,34 @@ uses RPM's tilde form in the `.rpm` (`1.0.0~beta.1`, which sorts *before*
 follows the same rule, the Snap Store channel maps to `beta`, and GitHub
 marks the release as a prerelease.
 
+## Nix package updates (optional template)
+
+If the app repo also carries a Nix package that wraps the released binaries
+(`nix/package.nix`, e.g. `appimageTools.wrapType2` over the AppImage), copy
+[`templates/update-nix.yml`](templates/update-nix.yml) to
+`.github/workflows/`. On each stable release it downloads the x86_64 and
+aarch64 files the package uses, checks them against `SHA256SUMS`, computes
+Nix SRI hashes (`sha256-` + base64 of the raw digest), rewrites `version`
+and the two `"<arch>-linux" = "sha256-…";` lines, and opens a PR — or does
+nothing if the file already pins that version or the `nix/update-<ver>`
+branch exists. Prereleases are never pinned. Set `PRODUCT` (and
+`RELEASES_REPO` if you use one) in its `env:` block.
+
+Three caveats, all GitHub's:
+
+- **`on: release` needs a non-`GITHUB_TOKEN` publish.** Events caused by
+  `GITHUB_TOKEN` do not start workflows. `release.yml` publishes with
+  `RELEASES_TOKEN` when it is set and with `GITHUB_TOKEN` otherwise — in
+  the second case the release event never fires and only
+  `workflow_dispatch` runs this.
+- **The event fires where the release lives.** With `releases_repo` set,
+  `release: published` happens on the mirror, not the app repo; dispatch
+  it manually (or from the release pipeline) instead.
+- **The PR is opened with `GITHUB_TOKEN`,** so it needs *Settings → Actions
+  → General → Allow GitHub Actions to create and approve pull requests*,
+  and it will not trigger your `pull_request` CI — close and reopen it, or
+  swap in an App token, if a green check is required to merge.
+
 ## Cross-repo tokens
 
 Needed only for private app repos (per app, or org-level shared to selected
@@ -330,8 +358,8 @@ that matter:
 - [docs/SIGNING.md](docs/SIGNING.md) — the GPG key, what it signs, what
   users run to verify, pacman/apt/dnf repository notes
 - [templates/](templates/) — the caller workflow, `nfpm.yaml` (+ the COSMIC
-  variant `nfpm-cosmic.yaml`), desktop entry, AppStream MetaInfo and
-  `snapcraft.yaml` to copy into an app
+  variant `nfpm-cosmic.yaml`), desktop entry, AppStream MetaInfo,
+  `snapcraft.yaml` and the optional `update-nix.yml` to copy into an app
 
 ## Relation to the other kits
 

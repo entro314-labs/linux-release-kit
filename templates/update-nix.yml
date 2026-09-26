@@ -1,0 +1,180 @@
+# OPTIONAL: keeps a Nix package that wraps this app's released binaries
+# (nix/package.nix) pinned to the latest stable release, by opening a PR that
+# bumps its version and per-architecture hashes.
+# Copy to .github/workflows/update-nix.yml in the app repo ONLY if it ships
+# such a package; the linux-release-kit README ("Nix package updates") has
+# the caveats. In short:
+#   - `on: release` fires only when the release was PUBLISHED with a PAT or
+#     GitHub App token. The kit publishes with RELEASES_TOKEN when set, and
+#     with GITHUB_TOKEN otherwise — a GITHUB_TOKEN publish triggers nothing.
+#   - the event fires on the repo that HOSTS the release. With releases_repo
+#     set that is the mirror, so in the app repo only workflow_dispatch runs.
+#   - a PR opened with GITHUB_TOKEN does not trigger your pull_request CI,
+#     and needs "Allow GitHub Actions to create and approve pull requests"
+#     enabled under Settings → Actions → General.
+#
+# Expected nix/package.nix shape (the sed patterns below rely on it):
+#   version = "1.2.3";
+#   ...
+#   hash = {
+#     "x86_64-linux" = "sha256-…";
+#     "aarch64-linux" = "sha256-…";
+#   }.${stdenv.hostPlatform.system};
+name: Update Nix package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to pin (vX.Y.Z). Empty = the latest stable release.'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: update-nix
+  cancel-in-progress: false
+
+jobs:
+  update-nix:
+    # Prereleases never become the pinned package.
+    if: github.event_name != 'release' || github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write        # push the update branch
+      pull-requests: write   # open the PR
+    env:
+      PRODUCT: 'myapp'                # ← release.yml product_name
+      RELEASES_REPO: ''               # ← release.yml releases_repo; empty = this repo
+      NIX_FILE: 'nix/package.nix'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The push below authenticates explicitly; nothing needs the token
+          # left in .git/config.
+          persist-credentials: false
+
+      - name: Resolve target version
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          REPO="${RELEASES_REPO:-$GITHUB_REPOSITORY}"
+          TAG="${EVENT_TAG:-${INPUT_TAG:-}}"
+          if [ -z "$TAG" ]; then
+            # `gh release view` with no tag = the latest release, which is
+            # never a prerelease or a draft.
+            TAG="$(gh release view --repo "$REPO" --json tagName --jq .tagName)"
+          fi
+          VERSION="${TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'${TAG}' is not a stable vX.Y.Z tag — prereleases are not pinned"
+            exit 1
+          fi
+          {
+            echo "repo=$REPO"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check whether an update is needed
+        id: check
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -f "$NIX_FILE" ] || { echo "::error::No ${NIX_FILE} — set NIX_FILE or delete this workflow"; exit 1; }
+          CURRENT="$(sed -n 's/^[[:space:]]*version = "\(.*\)";.*/\1/p' "$NIX_FILE" | head -1)"
+          [ -n "$CURRENT" ] || { echo "::error::No 'version = \"…\";' line in ${NIX_FILE}"; exit 1; }
+          if [ "$CURRENT" = "$VERSION" ]; then
+            echo "${NIX_FILE} already pins ${CURRENT}; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Pinned ${CURRENT} -> ${VERSION}"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Nix wants SRI hashes: "sha256-" + base64 of the raw digest. Each file
+      # is also checked against the release's SHA256SUMS, so the pin is
+      # provably the file every other channel ships.
+      - name: Compute SRI hashes
+        id: hash
+        if: steps.check.outputs.skip != 'true'
+        env:
+          REPO: ${{ steps.release.outputs.repo }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          WORK="$(mktemp -d)"
+          curl -fsSL --retry 3 --retry-delay 10 "${BASE}/SHA256SUMS" -o "${WORK}/SHA256SUMS"
+          for ARCH in x86_64 aarch64; do
+            # ← The released file the Nix package wraps. The AppImage suits
+            #   appimageTools.wrapType2; use ${PRODUCT}_${VERSION}_amd64.deb /
+            #   _arm64.deb instead if the package unpacks the .deb.
+            case "$ARCH" in
+              x86_64)  ASSET="${PRODUCT}_${VERSION}_x86_64.AppImage" ;;
+              aarch64) ASSET="${PRODUCT}_${VERSION}_aarch64.AppImage" ;;
+            esac
+            echo "Fetching ${BASE}/${ASSET}"
+            curl -fsSL --retry 3 --retry-delay 10 "${BASE}/${ASSET}" -o "${WORK}/${ASSET}"
+            ( cd "$WORK" && awk -v a="$ASSET" '$2 == a' SHA256SUMS | sha256sum -c - ) \
+              || { echo "::error::${ASSET} does not match the release's SHA256SUMS"; exit 1; }
+            SRI="sha256-$(sha256sum "${WORK}/${ASSET}" | cut -d' ' -f1 | xxd -r -p | base64 -w0)"
+            echo "${ARCH}: ${SRI}"
+            echo "${ARCH}=${SRI}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Update the Nix file
+        if: steps.check.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          X86_HASH: ${{ steps.hash.outputs.x86_64 }}
+          ARM_HASH: ${{ steps.hash.outputs.aarch64 }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^([[:space:]]*version = )\"[^\"]*\";|\1\"${VERSION}\";|" "$NIX_FILE"
+          sed -i -E "s|(\"x86_64-linux\" = )\"sha256-[^\"]*\";|\1\"${X86_HASH}\";|" "$NIX_FILE"
+          sed -i -E "s|(\"aarch64-linux\" = )\"sha256-[^\"]*\";|\1\"${ARM_HASH}\";|" "$NIX_FILE"
+          # A sed that matched nothing leaves the file as it was; refuse to
+          # open a PR that only half-updates it.
+          if ! grep -q "\"${X86_HASH}\"" "$NIX_FILE" || ! grep -q "\"${ARM_HASH}\"" "$NIX_FILE"; then
+            echo "::error::${NIX_FILE} has no '\"x86_64-linux\" = \"sha256-…\";' / '\"aarch64-linux\" = …' lines to update"
+            exit 1
+          fi
+          git diff -- "$NIX_FILE"
+
+      - name: Open a pull request
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          BRANCH="nix/update-${VERSION}"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # An open (or merged-but-undeleted) branch for this version means a
+          # previous run already did this; don't open a duplicate.
+          if git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch ${BRANCH} already exists; skipping."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$BRANCH"
+          git add "$NIX_FILE"
+          git commit -q -m "chore(nix): pin ${PRODUCT} ${VERSION}" \
+            -m "Bumps version and both per-arch SRI hashes in ${NIX_FILE}."
+          git push "$REMOTE" "HEAD:refs/heads/${BRANCH}"
+          gh pr create --head "$BRANCH" \
+            --title "chore(nix): pin ${PRODUCT} ${VERSION}" \
+            --body "Updates \`version\` and the x86_64/aarch64 SRI hashes in \`${NIX_FILE}\` to the v${VERSION} release (each file checked against its SHA256SUMS). Opened by the update-nix workflow."
