@@ -229,7 +229,7 @@ jobs:
       INPUT_TAG: ${{ inputs.tag }}
       RELEASES_REPO: ${{ inputs.releases_repo }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A dispatch retry names the tag; without this it would build whatever the
           # default branch is at retry time and attach that beside the tag's assets.
@@ -368,7 +368,7 @@ jobs:
     outputs:
       release_id: ${{ steps.create-release.outputs.result }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A dispatch retry names the tag; without this it would build whatever the
           # default branch is at retry time and attach that beside the tag's assets.
@@ -403,7 +403,7 @@ jobs:
       # a hard error — never silently overwrite what users already downloaded.
       - name: Create or reuse draft release
         id: create-release
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
@@ -461,7 +461,7 @@ jobs:
       FORMATS: ${{ matrix.formats }}
       DIST: ${{ github.workspace }}/.release-kit/dist
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A dispatch retry names the tag; without this it would build whatever the
           # default branch is at retry time and attach that beside the tag's assets.
@@ -489,14 +489,14 @@ jobs:
 
       - name: Setup Rust
         if: inputs.rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
       - name: Cache Rust workspace
         if: inputs.rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ inputs.rust_workspace_dir }}
           shared-key: ${{ matrix.target }}
@@ -977,7 +977,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify release assets (via API)
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
           REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
@@ -1028,7 +1028,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Publish release
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
           REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
