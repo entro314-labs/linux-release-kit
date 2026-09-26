@@ -1122,7 +1122,12 @@ jobs:
 
   # Fail loud BEFORE the draft flips public: every format for every SHIPPED
   # target (not just this run's build set) must be on the release, plus the
-  # checksums — and their signature when signing is configured.
+  # checksums — and their signature when signing is configured. Then every
+  # asset's bytes are checked without downloading them: GitHub computes a
+  # sha256 `digest` for each uploaded asset, and it must equal what
+  # SHA256SUMS says for that file. That catches a truncated or half-failed
+  # upload, and an asset re-uploaded (by a retried leg) after the checksums
+  # job ran, which would otherwise publish a SHA256SUMS the file fails.
   verify-release:
     needs: [preflight, plan, create-release, build, checksums]
     runs-on: ubuntu-latest
@@ -1132,6 +1137,7 @@ jobs:
       contents: write
     steps:
       - name: Verify release assets (via API)
+        id: verify
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
@@ -1146,10 +1152,9 @@ jobs:
           github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const { RELEASE_ID, REL_OWNER, REL_NAME, BARE, PRODUCT, TARGETS, FORMATS, SIGNING } = process.env;
-            const { data: release } = await github.rest.repos.getRelease({
-              owner: REL_OWNER, repo: REL_NAME, release_id: Number(RELEASE_ID),
-            });
-            const names = new Set(release.assets.map((a) => a.name));
+            const owner = REL_OWNER;
+            const repo = REL_NAME;
+            const release_id = Number(RELEASE_ID);
             const legs = {
               'linux-x86_64':  { arch: 'x86_64',  deb: 'amd64', rpm: 'x86_64' },
               'linux-aarch64': { arch: 'aarch64', deb: 'arm64', rpm: 'aarch64' },
@@ -1171,12 +1176,118 @@ jobs:
             }
             expected.push('SHA256SUMS');
             if (SIGNING === 'true') expected.push('SHA256SUMS.asc');
-            const missing = expected.filter((n) => !names.has(n));
-            if (missing.length) {
-              core.setFailed(`Release ${release.tag_name} is missing expected assets:\n  - ${missing.join('\n  - ')}\nPresent: ${[...names].join(', ')}`);
+
+            // The checksums job sums every asset except SHA256SUMS itself and
+            // the *.asc files it uploads alongside (the signature and the
+            // public key); everything else must have a SHA256SUMS line.
+            const unsummed = (name) => name === 'SHA256SUMS' || name.endsWith('.asc');
+            const list = (xs) => xs.slice(0, 10).join(', ') + (xs.length > 10 ? `, … (${xs.length} total)` : '');
+
+            async function readSums(assets) {
+              const sums = assets.find((a) => a.name === 'SHA256SUMS');
+              if (!sums) return null;
+              const { data } = await github.rest.repos.getReleaseAsset({
+                owner, repo, asset_id: sums.id, headers: { accept: 'application/octet-stream' },
+              });
+              const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+              const map = new Map();
+              for (const line of text.split('\n')) {
+                const m = line.match(/^([a-f0-9]{64}) [ *](.+)$/);
+                if (m) map.set(m[2], m[1]);
+              }
+              return map;
+            }
+
+            async function check() {
+              const { data: release } = await github.rest.repos.getRelease({ owner, repo, release_id });
+              const assets = release.assets;
+              const byName = new Map(assets.map((a) => [a.name, a]));
+              const checks = [];
+              const add = (name, bad, what) => checks.push({
+                name, ok: bad.length === 0, detail: bad.length ? `${what}: ${list(bad)}` : 'ok',
+              });
+
+              checks.push({ name: 'still a draft', ok: release.draft === true,
+                detail: release.draft ? 'ok' : 'the release was published while this run was verifying it' });
+              add('expected assets present', expected.filter((n) => !byName.has(n)), 'missing');
+              add('no empty assets', assets.filter((a) => !(Number.isSafeInteger(a.size) && a.size > 0)).map((a) => a.name), 'size 0');
+              add('GitHub sha256 digest present',
+                assets.filter((a) => !/^sha256:[a-f0-9]{64}$/.test(String(a.digest || ''))).map((a) => a.name), 'no digest yet');
+
+              const sums = await readSums(assets);
+              if (!sums) {
+                checks.push({ name: 'digests match SHA256SUMS', ok: false, detail: 'SHA256SUMS is not on the release' });
+              } else {
+                const mismatched = [];
+                for (const [name, hash] of sums) {
+                  const a = byName.get(name);
+                  if (!a) mismatched.push(`${name} (listed, not on the release)`);
+                  else if (a.digest && a.digest !== `sha256:${hash}`) mismatched.push(`${name} (${a.digest} ≠ sha256:${hash})`);
+                }
+                for (const a of assets) {
+                  if (!unsummed(a.name) && !sums.has(a.name)) mismatched.push(`${a.name} (not in SHA256SUMS)`);
+                }
+                add('digests match SHA256SUMS', mismatched, 'mismatch');
+              }
+              return { release, checks };
+            }
+
+            // GitHub fills `digest` in asynchronously after an upload, so a
+            // failure is re-read a few times before it counts.
+            const ATTEMPTS = 8;
+            let result;
+            for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+              result = await check();
+              const failing = result.checks.filter((c) => !c.ok);
+              if (!failing.length) break;
+              if (attempt < ATTEMPTS) {
+                core.info(`Attempt ${attempt}/${ATTEMPTS}: ${failing.map((c) => c.name).join('; ')} — re-reading in 5 s`);
+                await new Promise((r) => setTimeout(r, 5000));
+              }
+            }
+            const { release, checks } = result;
+            // Outputs first: the summary step reads them even when this fails.
+            core.setOutput('asset_count', String(release.assets.length));
+            core.setOutput('html_url', release.html_url);
+            core.setOutput('checks', JSON.stringify(checks.map((c) => ({
+              ...c, detail: c.detail.replace(/\|/g, '\\|').replace(/\n/g, ' '),
+            }))));
+            const failed = checks.filter((c) => !c.ok);
+            if (failed.length) {
+              core.setFailed(`Release ${release.tag_name} on ${owner}/${repo} failed verification:\n  - ${failed.map((c) => `${c.name}: ${c.detail}`).join('\n  - ')}\nPresent: ${release.assets.map((a) => a.name).join(', ')}`);
               return;
             }
-            core.info(`Verified ${expected.length} expected assets on ${REL_OWNER}/${REL_NAME} release ${release.tag_name}.`);
+            core.info(`Verified ${expected.length} expected assets and ${release.assets.length} digests on ${owner}/${repo} release ${release.tag_name}.`);
+
+      # Written even when verification fails, so a red run explains itself on
+      # its summary page.
+      - name: Summary
+        if: always()
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
+          REL_NAME: ${{ needs.preflight.outputs.releases_name }}
+          HTML_URL: ${{ steps.verify.outputs.html_url }}
+          ASSET_COUNT: ${{ steps.verify.outputs.asset_count }}
+          CHECKS: ${{ steps.verify.outputs.checks }}
+          OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          {
+            echo "## Release verification: ${VERSION}"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Release (draft) | ${HTML_URL:-https://github.com/${REL_OWNER}/${REL_NAME}/releases} |"
+            echo "| Assets | ${ASSET_COUNT:-unknown} |"
+            echo "| Verification | ${OUTCOME} |"
+            if [ -n "${CHECKS:-}" ]; then
+              echo
+              echo "| Check | Result | Detail |"
+              echo "| --- | --- | --- |"
+              jq -r '.[] | "| \(.name) | \(if .ok then "pass" else "**FAIL**" end) | \(.detail) |"' <<<"$CHECKS"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish-release:
     needs: [preflight, plan, create-release, verify-release]
@@ -1186,6 +1297,7 @@ jobs:
       contents: write
     steps:
       - name: Publish release
+        id: publish
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
@@ -1203,6 +1315,7 @@ jobs:
       # UNAUTHENTICATED client — that is what every user, AUR helper and COPR
       # builder is. This can only pass when the releases repo is PUBLIC.
       - name: Smoke-test public download URL
+        id: public_url
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
@@ -1217,3 +1330,23 @@ jobs:
           done
           [ "$CODE" = "200" ] || { echo "::error::SHA256SUMS not publicly reachable: HTTP $CODE $URL — is ${REL_OWNER}/${REL_NAME} public?"; exit 1; }
           echo "::notice::Published ${VERSION}: https://github.com/${REL_OWNER}/${REL_NAME}/releases/tag/${VERSION}"
+
+      - name: Summary
+        if: always()
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
+          REL_NAME: ${{ needs.preflight.outputs.releases_name }}
+          PUBLISH: ${{ steps.publish.outcome }}
+          PUBLIC_URL: ${{ steps.public_url.outcome }}
+        run: |
+          {
+            echo "## Publish: ${VERSION}"
+            echo
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Draft flipped to published | ${PUBLISH} |"
+            echo "| SHA256SUMS reachable anonymously | ${PUBLIC_URL} |"
+            echo
+            echo "Release: https://github.com/${REL_OWNER}/${REL_NAME}/releases/tag/${VERSION}"
+          } >> "$GITHUB_STEP_SUMMARY"

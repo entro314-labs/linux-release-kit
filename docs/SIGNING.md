@@ -98,7 +98,11 @@ platform level, which is what most users actually rely on.
   `SHA256SUMS`, signs it, verifies the signature, uploads both plus
   `<FPR>.asc`.
 - **Verify job** → refuses to publish if `SHA256SUMS.asc` is missing while
-  a key is configured.
+  a key is configured, if any asset is empty, or if the sha256 `digest`
+  GitHub computed for an asset on upload disagrees with that file's line in
+  `SHA256SUMS` (or the file has no line) — so the manifest users verify
+  against provably describes the bytes on the release. Its checks are
+  tabulated on the run's summary page, pass or fail.
 
 ## What users run
 
