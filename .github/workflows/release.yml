@@ -213,11 +213,20 @@ on:
         description: 'Key ID/fingerprint to sign with. Defaults to the first secret key in the imported keyring.'
         required: false
 
+# Every job below declares what it needs. In a reusable workflow the caller's
+# grant is the ceiling (templates/release.yml grants contents: write); nothing
+# here asks for more than that.
+permissions:
+  contents: read
+
 jobs:
   # Fail fast on a cheap runner: no CHANGELOG entry for the tag, or a missing
   # cross-repo token, means no matrix spin-up.
   preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.resolved.outputs.VERSION }}
       bare: ${{ steps.resolved.outputs.BARE }}
@@ -314,6 +323,8 @@ jobs:
   plan:
     needs: preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: {}
     outputs:
       matrix: ${{ steps.plan.outputs.MATRIX }}
       targets: ${{ steps.plan.outputs.TARGETS }}
@@ -368,6 +379,9 @@ jobs:
   create-release:
     needs: preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     outputs:
       release_id: ${{ steps.create-release.outputs.result }}
     steps:
@@ -451,6 +465,11 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    # Native builds of large apps (and the first, uncached aarch64 leg) are slow;
+    # this only caps GitHub's 6-hour default.
+    permissions:
+      contents: write
     env:
       # Exported for build_command, binary_path and nfpm.yaml alike. nfpm
       # expands ${VAR} in its config, so one variable set serves both.
@@ -915,6 +934,9 @@ jobs:
   checksums:
     needs: [preflight, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - name: Import signing key
         id: sign
@@ -984,6 +1006,10 @@ jobs:
   verify-release:
     needs: [preflight, plan, create-release, build, checksums]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Draft releases are invisible to a read-only token, so reading one needs write.
+    permissions:
+      contents: write
     steps:
       - name: Verify release assets (via API)
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -1035,6 +1061,9 @@ jobs:
   publish-release:
     needs: [preflight, plan, create-release, verify-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - name: Publish release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

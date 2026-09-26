@@ -122,9 +122,16 @@ on:
         description: 'Key ID/fingerprint to sign with. Defaults to the first secret key in the imported keyring.'
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   pacman-repo:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Reads release assets only; the push to pages_repo uses ARCH_REPO_TOKEN.
+    permissions:
+      contents: read
     steps:
       - name: Resolve release
         id: rel

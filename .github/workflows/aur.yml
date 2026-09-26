@@ -114,9 +114,16 @@ on:
         description: 'Fine-grained PAT with Contents:Read on releases_repo, when that repo is private'
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   aur:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Reads release assets only; the AUR push goes over SSH.
+    permissions:
+      contents: read
     steps:
       - name: Resolve release
         id: rel

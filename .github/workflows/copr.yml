@@ -76,9 +76,17 @@ on:
         description: 'Fine-grained PAT with Contents:Read on releases_repo, when that repo is private'
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   copr:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Reads release assets only. Longer than the other channels because
+    # `wait: true` blocks on the COPR build queue.
+    permissions:
+      contents: read
     steps:
       - name: Resolve release
         id: rel

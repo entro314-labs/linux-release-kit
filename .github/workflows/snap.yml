@@ -88,6 +88,9 @@ on:
         description: 'Fine-grained PAT with Contents:RW on releases_repo. Required when releases_repo is set.'
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   snap:
     strategy:
@@ -97,6 +100,10 @@ jobs:
     # The snap links against its core base, not the host — the glibc
     # baseline does not apply.
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    # Attaches the snap to the release (same-repo releases use github.token).
+    permissions:
+      contents: write
     steps:
       - name: Select architecture
         id: select
