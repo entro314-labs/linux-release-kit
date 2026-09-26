@@ -148,9 +148,11 @@ jobs:
           # Must match the arch step in release.yml: hyphens DELETED, so a
           # prerelease sorts before the stable release under vercmp.
           PKGVER="${VERSION//-/}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "pkgver=$PKGVER" >> "$GITHUB_OUTPUT"
-          echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "pkgver=$PKGVER"
+            echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
+          } >> "$GITHUB_OUTPUT"
 
       # The packages are verified against the release's SHA256SUMS before
       # anything is staged: what enters the pacman repo is provably the
@@ -205,9 +207,11 @@ jobs:
           FIRST_ARCH="${FOUND%% *}"
           PKGNAME=$(tar -xOf "${PKGS}/${PRODUCT}-${PKGVER}-1-${FIRST_ARCH}.pkg.tar.zst" .PKGINFO | sed -n 's/^pkgname = //p')
           [ -n "$PKGNAME" ] || { echo "::error::Could not read pkgname from the package's .PKGINFO"; exit 1; }
-          echo "arches=$FOUND" >> "$GITHUB_OUTPUT"
-          echo "pkgname=$PKGNAME" >> "$GITHUB_OUTPUT"
-          echo "pkgs=$PKGS" >> "$GITHUB_OUTPUT"
+          {
+            echo "arches=$FOUND"
+            echo "pkgname=$PKGNAME"
+            echo "pkgs=$PKGS"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Import signing key
         id: sign
@@ -342,7 +346,7 @@ jobs:
               # job down before repo-add ever runs — silently, since the
               # pipeline prints nothing on the way out.
               PRUNE="$(
-                ls "${STAGE}/${ARCH}/" 2>/dev/null \
+                find "${STAGE}/${ARCH}/" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
                   | grep -E "^${PRODUCT}-[0-9][^-]*-[0-9]+-${ARCH}\.pkg\.tar\.zst$" \
                   | grep -vx "${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst" \
                   | sort -V | head -n -"$KEEP" || true

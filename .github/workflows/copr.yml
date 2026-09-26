@@ -93,11 +93,13 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          # Mirrors release.yml's RPM filename scheme (prerelease '-' → '~').
-          echo "rpm_version=${VERSION//-/\~}" >> "$GITHUB_OUTPUT"
-          echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            # Mirrors release.yml's RPM filename scheme (prerelease '-' → '~').
+            echo "rpm_version=${VERSION//-/\~}"
+            echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install rpm tooling
         run: |
@@ -214,6 +216,7 @@ jobs:
             printf '  *) echo "no payload for %%{_arch}"; exit 1 ;;\n'
             printf 'esac\n'
             printf 'mkdir -p %%{buildroot}\n'
+            # shellcheck disable=SC2016 # $SRC is expanded by rpmbuild's %install shell, not this one
             printf '( cd %%{buildroot} && rpm2cpio "$SRC" | cpio -idmu --quiet )\n'
             # The file list is whatever the payload contains — generated at
             # install time so the spec never hardcodes paths that nfpm.yaml
@@ -226,9 +229,11 @@ jobs:
           } > "$SPEC"
           echo "--- ${NAME}.spec ---"
           cat "$SPEC"
-          echo "path=$SPEC" >> "$GITHUB_OUTPUT"
-          echo "workdir=$WORK" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          {
+            echo "path=$SPEC"
+            echo "workdir=$WORK"
+            echo "name=$NAME"
+          } >> "$GITHUB_OUTPUT"
 
       # Build the SRPM in a real Fedora, then prove the spec actually produces
       # a binary RPM from it (x86_64, the runner's own arch) — a %files or

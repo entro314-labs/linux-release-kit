@@ -234,6 +234,7 @@ jobs:
           # A dispatch retry names the tag; without this it would build whatever the
           # default branch is at retry time and attach that beside the tag's assets.
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Resolve version
         id: resolved
@@ -345,7 +346,7 @@ jobs:
               || { echo "::error::Unknown target '$t' in targets input (allowed: linux-x86_64, linux-aarch64)"; exit 1; }
           done
           for t in $BUILD_LIST; do
-            printf '%s\n' $TARGET_LIST | grep -qx -- "$t" \
+            printf '%s\n' "$TARGET_LIST" | grep -qx -- "$t" \
               || { echo "::error::build_targets entry '$t' is not in this app's targets set"; exit 1; }
           done
           FORMAT_LIST=$(norm "$FORMATS")
@@ -354,13 +355,15 @@ jobs:
             printf '%s\n' deb rpm appimage arch | grep -qx -- "$f" \
               || { echo "::error::Unknown format '$f' (allowed: deb, rpm, appimage, arch)"; exit 1; }
           done
-          FORMATS_CSV=$(printf '%s\n' $FORMAT_LIST | paste -sd, -)
-          MATRIX=$(printf '%s\n' $BUILD_LIST | jq -cRn --argjson legs "$LEGS" --arg fm "$FORMATS_CSV" \
+          FORMATS_CSV=$(printf '%s\n' "$FORMAT_LIST" | paste -sd, -)
+          MATRIX=$(printf '%s\n' "$BUILD_LIST" | jq -cRn --argjson legs "$LEGS" --arg fm "$FORMATS_CSV" \
             '{include: [inputs | $legs[.] + {formats: $fm}]}')
-          echo "MATRIX=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "TARGETS=$(printf '%s\n' $TARGET_LIST | paste -sd, -)" >> "$GITHUB_OUTPUT"
-          echo "FORMATS=$FORMATS_CSV" >> "$GITHUB_OUTPUT"
-          echo "Building: $(printf '%s\n' $BUILD_LIST | paste -sd, -) (shipping set: $(printf '%s\n' $TARGET_LIST | paste -sd, -)); formats: $FORMATS_CSV"
+          {
+            echo "MATRIX=$MATRIX"
+            echo "TARGETS=$(printf '%s\n' "$TARGET_LIST" | paste -sd, -)"
+            echo "FORMATS=$FORMATS_CSV"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building: $(printf '%s\n' "$BUILD_LIST" | paste -sd, -) (shipping set: $(printf '%s\n' "$TARGET_LIST" | paste -sd, -)); formats: $FORMATS_CSV"
 
   create-release:
     needs: preflight
@@ -373,6 +376,7 @@ jobs:
           # A dispatch retry names the tag; without this it would build whatever the
           # default branch is at retry time and attach that beside the tag's assets.
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       # The release body IS the tag's CHANGELOG section — it is what users read
       # on the release page and what the stores' "what's new" pulls from.
@@ -466,6 +470,7 @@ jobs:
           # A dispatch retry names the tag; without this it would build whatever the
           # default branch is at retry time and attach that beside the tag's assets.
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       # Plain apt-get, NOT a caching action: on a real release's arm64 leg a
       # cache action reported "installing 12 packages... done" while
@@ -484,6 +489,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
+          # Unquoted on purpose: apt_packages is a space-separated list.
+          # shellcheck disable=SC2086
           sudo apt-get install -y rpm gettext-base desktop-file-utils file zstd $APT_PACKAGES
           sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
 
@@ -676,10 +683,12 @@ jobs:
             echo "::error::metainfo input points at '${METAINFO}', which does not exist"
             exit 1
           fi
-          echo "desktop=$DESKTOP" >> "$GITHUB_OUTPUT"
-          echo "icon=$ICON_PATH" >> "$GITHUB_OUTPUT"
-          echo "metainfo=${METAINFO:-}" >> "$GITHUB_OUTPUT"
-          echo "nfpm=$NFPM_CONFIG" >> "$GITHUB_OUTPUT"
+          {
+            echo "desktop=$DESKTOP"
+            echo "icon=$ICON_PATH"
+            echo "metainfo=${METAINFO:-}"
+            echo "nfpm=$NFPM_CONFIG"
+          } >> "$GITHUB_OUTPUT"
 
       # nfpm writes deb AND rpm AND the Arch package from one config, with
       # per-packager overrides for the names that differ (a Fedora `Requires:`
@@ -1053,7 +1062,7 @@ jobs:
           set -euo pipefail
           URL="https://github.com/${REL_OWNER}/${REL_NAME}/releases/download/${VERSION}/SHA256SUMS"
           CODE=000
-          for attempt in 1 2 3; do
+          for _ in 1 2 3; do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' -L -A release-verify "$URL") && [ "$CODE" = "200" ] && break
             sleep 10
           done

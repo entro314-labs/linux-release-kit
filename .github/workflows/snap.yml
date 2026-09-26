@@ -113,6 +113,8 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.select.outputs.selected == 'true'
+        with:
+          persist-credentials: false
 
       - name: Resolve release
         id: rel
@@ -138,10 +140,12 @@ jobs:
               *)       CHANNEL=stable ;;
             esac
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+            echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download the .deb into the staging path
         id: deb
