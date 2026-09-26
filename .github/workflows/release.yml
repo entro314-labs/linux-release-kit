@@ -1,9 +1,9 @@
 # Reusable Linux release workflow for any compiled desktop app: native
 # x86_64 + aarch64 legs on a pinned glibc baseline, .deb + .rpm + Arch
 # .pkg.tar.zst via nfpm, AppImage via linuxdeploy, one GPG key signing the
-# AppImage + the RPM + the Arch package + a SHA256SUMS manifest, changelog
-# guard, pre-publish verification, and cross-repo publishing to a public
-# releases mirror.
+# AppImage + the RPM + the Arch package + a SHA256SUMS manifest, a source
+# SBOM, GitHub build-provenance attestations, changelog guard, pre-publish
+# verification, and cross-repo publishing to a public releases mirror.
 #
 # The sibling tauri-release-kit owns Tauri apps (its bundler emits these same
 # formats). This kit is for everything else — iced, COSMIC, egui, GTK-rs,
@@ -245,8 +245,11 @@ on:
         required: false
 
 # Every job below declares what it needs. In a reusable workflow the caller's
-# grant is the ceiling (templates/release.yml grants contents: write); nothing
-# here asks for more than that.
+# grant is the ceiling, so the caller must grant contents: write, id-token:
+# write and attestations: write (templates/release.yml does). The last two
+# are used only by the attest job, but GitHub checks them for the whole
+# called workflow: a caller that grants only contents: write fails before
+# any job starts.
 permissions:
   contents: read
 
@@ -1126,9 +1129,9 @@ jobs:
           echo "Uploaded $(find "$DIST" -type f | wc -l) asset(s) for ${RK_TARGET} to ${REPO}@${RK_TAG}"
 
   # One SHA256SUMS over every artifact on the draft (both legs, including
-  # ones a previous attempt uploaded), GPG-signed when a key is present. This
-  # is the only integrity check a standalone .deb gets, and what the AUR and
-  # COPR recipes pin their checksums against.
+  # ones a previous attempt uploaded) plus the SBOMs, GPG-signed when a key
+  # is present. This is the only integrity check a standalone .deb gets, and
+  # what the AUR and COPR recipes pin their checksums against.
   checksums:
     needs: [preflight, build]
     runs-on: ubuntu-latest
@@ -1136,6 +1139,35 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The SBOM describes the tagged source, same ref the legs built.
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+
+      # A source-level SBOM (every locked dependency Syft recognises —
+      # Cargo.lock, go.sum, package-lock.json, …) in both formats scanners
+      # ingest. Generated HERE, before SHA256SUMS is written, so the
+      # manifest and its signature cover the SBOMs too and nothing has to
+      # be re-signed afterwards.
+      - name: Generate SBOM
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          PRODUCT: ${{ inputs.product_name }}
+          BARE: ${{ needs.preflight.outputs.bare }}
+        run: |
+          set -euo pipefail
+          SBOM="${RUNNER_TEMP}/sbom"
+          mkdir -p "$SBOM"
+          "$SYFT" scan dir:. --source-name "$PRODUCT" --source-version "$BARE" \
+            -o "spdx-json=${SBOM}/${PRODUCT}_${BARE}.spdx.json" \
+            -o "cyclonedx-json=${SBOM}/${PRODUCT}_${BARE}.cdx.json"
+          ls -l "$SBOM"
+
       - name: Import signing key
         id: sign
         env:
@@ -1180,11 +1212,13 @@ jobs:
           gh release download "$TAG" --repo "$REPO" --dir . --clobber
           # A retry run's draft already carries the previous attempt's sums.
           rm -f SHA256SUMS SHA256SUMS.asc ./*.asc
+          # This run's SBOMs replace any a previous attempt uploaded.
+          cp "${RUNNER_TEMP}"/sbom/* .
           set -- *
           [ -e "$1" ] || { echo "::error::No assets on ${REPO}@${TAG} to checksum"; exit 1; }
           sha256sum -- "$@" > SHA256SUMS
           cat SHA256SUMS
-          UPLOAD="SHA256SUMS"
+          UPLOAD="SHA256SUMS $(cd "${RUNNER_TEMP}/sbom" && echo *)"
           if [ "$SIGNING" = "true" ]; then
             gpg --batch --yes -u "$KEY_ID" ${LINUX_GPG_PASSPHRASE:+--passphrase "$LINUX_GPG_PASSPHRASE"} \
               --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
@@ -1193,10 +1227,60 @@ jobs:
             # --import` and `gpg --verify` instructions can point at a URL
             # that moves with the release.
             gpg --armor --export "$KEY_ID" > "${KEY_ID}.asc"
-            UPLOAD="SHA256SUMS SHA256SUMS.asc ${KEY_ID}.asc"
+            UPLOAD="${UPLOAD} SHA256SUMS.asc ${KEY_ID}.asc"
           fi
           # shellcheck disable=SC2086
           gh release upload "$TAG" $UPLOAD --repo "$REPO" --clobber
+
+  # Build provenance for every file SHA256SUMS lists, once, after the last
+  # asset is on the draft — one job holding id-token instead of one per leg.
+  # The attestation is stored in the repository RUNNING this workflow (the
+  # app repo), not in releases_repo; `gh attestation verify <file> --repo
+  # <app repo> --signer-repo <this kit's repo>` checks it (docs/SIGNING.md).
+  # --signer-repo is mandatory there because a reusable workflow signs.
+  #
+  # GitHub offers attestations for public repositories on every plan, but
+  # for PRIVATE ones only on Enterprise Cloud. A private app repo on
+  # Free/Pro/Team therefore fails the attest call; that is a plan limit, not
+  # a broken release, so it is a warning and the release proceeds.
+  attest:
+    needs: [preflight, checksums]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write        # SHA256SUMS is read from the still-draft release
+      id-token: write        # Sigstore signing certificate
+      attestations: write    # store the attestation on this repository
+    steps:
+      - name: Download SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          REPO: ${{ needs.preflight.outputs.releases_owner }}/${{ needs.preflight.outputs.releases_name }}
+          TAG: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS --dir "${RUNNER_TEMP}/attest" --clobber
+          cat "${RUNNER_TEMP}/attest/SHA256SUMS"
+
+      - name: Attest build provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/attest/SHA256SUMS
+
+      - name: Report attestation outcome
+        env:
+          OUTCOME: ${{ steps.attest.outcome }}
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            echo "::notice::Build provenance attested for every file in SHA256SUMS (stored on ${GITHUB_REPOSITORY}). Verify with: gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --signer-repo entro314-labs/linux-release-kit (or your fork of the kit)"
+          elif [ "$PRIVATE" = "true" ]; then
+            echo "::warning::Artifact attestation failed on private ${GITHUB_REPOSITORY}. Private repositories get attestations only on GitHub Enterprise Cloud; on Free/Pro/Team this is expected. The release continues without provenance."
+          else
+            echo "::warning::Artifact attestation failed on public ${GITHUB_REPOSITORY} (see the step above). The release continues without provenance; re-run the attest job to add it."
+          fi
 
   # Fail loud BEFORE the draft flips public: every format for every SHIPPED
   # target (not just this run's build set) must be on the release, plus the
@@ -1256,6 +1340,7 @@ jobs:
                 }
               }
             }
+            expected.push(`${PRODUCT}_${BARE}.spdx.json`, `${PRODUCT}_${BARE}.cdx.json`);
             expected.push('SHA256SUMS');
             if (SIGNING === 'true') expected.push('SHA256SUMS.asc');
 
@@ -1372,7 +1457,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish-release:
-    needs: [preflight, plan, create-release, verify-release]
+    needs: [preflight, plan, create-release, verify-release, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

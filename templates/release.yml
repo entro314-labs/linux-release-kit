@@ -41,8 +41,12 @@ concurrency:
 jobs:
   release:
     uses: entro314-labs/linux-release-kit/.github/workflows/release.yml@main
+    # All three are required: GitHub rejects the whole run before it starts
+    # if the called workflow's attest job asks for more than this grants.
     permissions:
       contents: write
+      id-token: write        # build-provenance attestation (Sigstore)
+      attestations: write    # stores the attestation on this repo
     with:
       app_display_name: 'MyApp'        # ← release titles: "MyApp v1.0.0"
       product_name: 'myapp'            # ← asset filename stem; lowercase, no spaces

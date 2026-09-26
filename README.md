@@ -34,6 +34,14 @@ All six are `workflow_call` reusable workflows — fixes land here once and
 every app picks them up. The last five chain off `release.yml` with `needs:`
 in one caller file; see [`templates/release.yml`](templates/release.yml).
 
+**Caller permissions.** The `release` job must grant `contents: write`,
+`id-token: write` and `attestations: write` (as the template does). The
+last two feed the attestation job; a caller that grants only
+`contents: write` — every caller written before attestations were added —
+is rejected by GitHub before any job runs (the nested `attest` job asks
+for permissions the caller does not allow). Add the two lines when you bump
+the kit reference.
+
 **Pinning.** Reference the kit at a reviewed commit SHA
 (`…/release.yml@<sha>`), not `@main`: the workflow runs with
 `contents: write` and your signing key. Bump all five references in an app
@@ -279,6 +287,7 @@ Every downstream workflow matches on these exact names; they are built from
 | AppImage | `<product>_<ver>_x86_64.AppImage` | `<product>_<ver>_aarch64.AppImage` |
 | AppImage update (`appimage_update_info` only) | `<product>_<ver>_x86_64.AppImage.zsync` | `<product>_<ver>_aarch64.AppImage.zsync` |
 | Checksums | `SHA256SUMS`, `SHA256SUMS.asc`, `<FPR>.asc` | |
+| SBOM (source-level, one per release) | `<product>_<ver>.spdx.json`, `<product>_<ver>.cdx.json` | |
 
 A prerelease `1.0.0-beta.1` keeps its dash in the `.deb`/AppImage names and
 uses RPM's tilde form in the `.rpm` (`1.0.0~beta.1`, which sorts *before*

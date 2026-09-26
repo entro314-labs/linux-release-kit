@@ -13,6 +13,8 @@ page is the setup and the reasoning; the workflow does the rest.
 | Arch `.pkg.tar.zst` | Detached binary signature `.sig` (pacman's native form) | `release.yml` build leg | pacman, per the user's `SigLevel` |
 | pacman repo database | Detached `.sig` on `<repo>.db` / `.files` | `arch-repo.yml` | pacman, per the user's `SigLevel` |
 | `SHA256SUMS` | Detached armored signature `SHA256SUMS.asc` | `release.yml` checksums job | `gpg --verify` |
+| Every file in `SHA256SUMS` | GitHub build-provenance attestation (Sigstore, keyless) | `release.yml` attest job | `gh attestation verify` |
+| SBOM (`.spdx.json` / `.cdx.json`) | Listed in `SHA256SUMS`, so covered by its signature and the attestation | `release.yml` checksums job | `sha256sum -c` |
 | Flatpak bundle / Flathub | OSTree repo-level signing | Flathub's infrastructure | Flatpak |
 | Snap | Store assertions | Canonical | snapd |
 | AUR | None (sha256 in the PKGBUILD pin the `.deb`) | — | makepkg |
@@ -125,6 +127,37 @@ rpm -K myapp-X.Y.Z-1.x86_64.rpm
 # or, with the AppImage project's validator:
 ./validate-x86_64.AppImage myapp_X.Y.Z_x86_64.AppImage
 ```
+
+## Build provenance (attestations)
+
+Independent of the GPG key: the attest job asks GitHub to sign, with a
+short-lived Sigstore certificate bound to the workflow run, a statement that
+each file listed in `SHA256SUMS` was built by this repository's workflow at
+this commit. Nothing to configure beyond the caller's `id-token: write` +
+`attestations: write` grant (see the README's "Caller permissions").
+
+```sh
+gh attestation verify myapp_X.Y.Z_amd64.deb --repo ORG/APP-REPO \
+  --signer-repo entro314-labs/linux-release-kit
+```
+
+`--signer-repo` is required, not optional: the signing happens inside the
+kit's reusable workflow, and `gh` insists on validating a reusable
+workflow's identity explicitly (`--signer-workflow
+entro314-labs/linux-release-kit/.github/workflows/release.yml` is the
+stricter form).
+
+`--repo` is the repository that **ran** the release workflow — the app
+repo — even when the files are downloaded from a `releases_repo` mirror:
+attestations are stored where the workflow ran, not where the assets are
+served. If the app repo is private, only people with access to it can fetch
+its attestations.
+
+Availability: GitHub offers attestations on public repositories on every
+plan, and on private repositories only with Enterprise Cloud. On a private
+app repo under Free/Pro/Team the attest step fails; the pipeline turns that
+into a warning and publishes without provenance, since the GPG signature and
+`SHA256SUMS` still stand.
 
 ## The pacman repository
 
