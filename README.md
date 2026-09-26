@@ -180,6 +180,27 @@ the baseline from the `.deb`/`.rpm`.
    A release already PUBLISHED for the tag is never reused — the run fails
    loudly; bump the version instead.
 
+## Smoke test before upload (optional)
+
+`smoke_test: true` makes every build leg exercise its packages on its own
+runner before anything is uploaded — the other checks only read metadata, so
+a startup panic or an unresolvable library would otherwise ship:
+
+- **`.deb`** — its `Version` must carry the tag (catches an `nfpm.yaml` with
+  a hard-coded version); `apt-get install` must resolve every declared
+  dependency name on the baseline distro; `ldd` must resolve every library
+  the installed `/usr/bin` binaries link. The build's own `-dev` packages are
+  on that runner, so a library *missing* from `depends:` still passes — only
+  a clean machine catches that.
+- **AppImage** — extracted and started under Xvfb with `smoke_args`; it must
+  still be running when the 15 s timeout kills it, and its output must not
+  contain `panicked at`, `symbol lookup error` or `error while loading shared
+  libraries`.
+
+The app therefore has to stay up for 15 s with no GPU and no user input. If
+it needs a flag for that (an empty window, no first-run dialog), pass it in
+`smoke_args`; a flag that makes it exit (`--version`) fails the test.
+
 ## The local half: release-kit
 
 `release.yml` starts at the pushed tag. Everything before it — choosing the

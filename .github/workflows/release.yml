@@ -183,6 +183,25 @@ on:
         required: false
         type: string
         default: ''
+      smoke_test:
+        description: >-
+          Before uploading, check the packages on each leg's own runner: the
+          .deb's Version matches the tag and it installs with every linked
+          library resolved, and the AppImage launches under Xvfb and is still
+          running after 15 s. The app must stay up that long without a GPU or
+          user input (see smoke_args).
+        required: false
+        type: boolean
+        default: false
+      smoke_args:
+        description: >-
+          Arguments passed to the app for the smoke_test launch (space-
+          separated), e.g. a flag that opens an empty window or skips a
+          first-run dialog. Must NOT make it exit: the test requires it alive
+          when the 15 s timeout fires.
+        required: false
+        type: string
+        default: ''
       runner_x86_64:
         description: 'Runner label for the x86_64 leg. This IS the glibc baseline — see the header.'
         required: false
@@ -935,6 +954,85 @@ jobs:
               echo "::warning::$(basename "$OUTPUT") has no readable embedded signature. Publish the key fingerprint ${KEY_ID} over TLS so users can check it with the AppImage validate tool."
             fi
           fi
+
+      # Opt-in (smoke_test: true). Every check above reads package METADATA;
+      # this one runs what users download, on the leg's own architecture and
+      # before anything is uploaded — a startup panic or an unresolvable
+      # library otherwise ships and is found by users.
+      #   .deb:     the Version field carries the tag (catches an nfpm.yaml
+      #             with a hard-coded version), `apt-get install` resolves
+      #             every declared Depends name against the baseline distro,
+      #             and `ldd` finds every library the installed binaries link.
+      #             The build's own -dev packages are on this runner, so ldd
+      #             cannot catch a library missing from Depends — only a
+      #             clean machine can.
+      #   AppImage: extracted and launched under Xvfb; it must still be
+      #             running when `timeout` kills it (exit 124), and its output
+      #             must carry no panic or dynamic-loader error.
+      - name: Smoke-test the packages
+        if: inputs.smoke_test
+        env:
+          SMOKE_ARGS: ${{ inputs.smoke_args }}
+        run: |
+          set -euo pipefail
+          case ",$FORMATS," in
+            *,deb,*)
+              DEB="${DIST}/${RK_PRODUCT}_${RK_VERSION}_${RK_DEB_ARCH}.deb"
+              # nfpm writes <version>[~<prerelease>]-<release>, optionally
+              # behind an epoch: compare everything before the release.
+              EXPECTED="${RK_VERSION/-/\~}"
+              DEB_VERSION="$(dpkg-deb -f "$DEB" Version)"
+              case "${DEB_VERSION#*:}" in
+                "$EXPECTED"|"$EXPECTED"-*) echo "$(basename "$DEB"): Version ${DEB_VERSION}" ;;
+                *) echo "::error::$(basename "$DEB") carries Version '${DEB_VERSION}', expected ${EXPECTED}[-<release>] — does nfpm.yaml use version: \${RK_VERSION}?"; exit 1 ;;
+              esac
+              PKG="$(dpkg-deb -f "$DEB" Package)"
+              sudo apt-get install -y "$DEB"
+              UNRESOLVED=""
+              while read -r BIN_FILE; do
+                # ldd exits non-zero on a static binary; that is not a failure.
+                LDD="$(ldd "$BIN_FILE" 2>&1 || true)"
+                if grep -q 'not found' <<<"$LDD"; then
+                  UNRESOLVED="${UNRESOLVED}${BIN_FILE}:"$'\n'"$(grep 'not found' <<<"$LDD")"$'\n'
+                fi
+              done < <(dpkg -L "$PKG" | grep -E '^/usr/bin/[^/]+$')
+              sudo apt-get remove -y "$PKG"
+              if [ -n "$UNRESOLVED" ]; then
+                echo "::error::The installed .deb links libraries that do not resolve:"
+                printf '%s' "$UNRESOLVED"
+                exit 1
+              fi
+              echo "Installed ${PKG} and resolved every linked library."
+              ;;
+            *) echo "::notice::smoke_test: no deb in formats — skipping the install check." ;;
+          esac
+
+          case ",$FORMATS," in
+            *,appimage,*)
+              APPIMAGE="${DIST}/${RK_PRODUCT}_${RK_VERSION}_${RK_ARCH}.AppImage"
+              sudo apt-get install -y xvfb
+              SMOKE="${RUNNER_TEMP}/smoke"
+              rm -rf "$SMOKE" && mkdir -p "$SMOKE" && cd "$SMOKE"
+              "$APPIMAGE" --appimage-extract >/dev/null
+              set +e
+              # smoke_args is a space-separated argument list, split on purpose.
+              # shellcheck disable=SC2086
+              timeout 15s xvfb-run -a ./squashfs-root/AppRun $SMOKE_ARGS > startup.log 2>&1
+              STATUS=$?
+              set -e
+              cat startup.log
+              if [ "$STATUS" -ne 124 ]; then
+                echo "::error::$(basename "$APPIMAGE") exited during startup with status ${STATUS} (expected it still running at the 15 s timeout)"
+                exit 1
+              fi
+              if grep -Ei 'panicked at|symbol lookup error|error while loading shared libraries' startup.log; then
+                echo "::error::$(basename "$APPIMAGE") logged a panic or a dynamic-loader error during startup (above)"
+                exit 1
+              fi
+              echo "$(basename "$APPIMAGE") was still running after 15 s."
+              ;;
+            *) echo "::notice::smoke_test: no appimage in formats — skipping the launch check." ;;
+          esac
 
       # --clobber so a retry of this leg replaces its own assets instead of
       # 422-ing; assets from the OTHER leg are untouched. gh resolves a draft
