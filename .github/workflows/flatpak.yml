@@ -61,11 +61,11 @@ on:
       runtime_version:
         description: >-
           Runtime branch. Flathub keeps several alive, so pin one and bump it
-          deliberately: freedesktop uses year-based branches (24.08), GNOME
-          release numbers (48), KDE Qt versions (6.9).
+          deliberately: freedesktop uses year-based branches (26.08), GNOME
+          release numbers (51), KDE Qt versions (6.11).
         required: false
         type: string
-        default: '24.08'
+        default: '26.08'
       arches:
         description: >-
           Comma-separated architectures to build (subset of: x86_64, aarch64).

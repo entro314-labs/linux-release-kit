@@ -107,7 +107,7 @@ jobs:
       # metainfo: 'packaging/linux/com.example.MyApp.metainfo.xml'  # ← required for Flathub
       # runtime: 'org.gnome.Platform'  # ← GTK apps; default is org.freedesktop.Platform
       # sdk: 'org.gnome.Sdk'
-      # runtime_version: '48'
+      # runtime_version: '51'           # ← with the GNOME runtime; default is 26.08
       # tray_icon: true                # ← only if the app has a tray icon
     secrets: inherit
 
