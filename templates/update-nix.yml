@@ -97,6 +97,10 @@ jobs:
           if [ "$CURRENT" = "$VERSION" ]; then
             echo "${NIX_FILE} already pins ${CURRENT}; nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -1)" = "$CURRENT" ]; then
+            # A hotfix on an older line, published after a newer release.
+            echo "${NIX_FILE} pins ${CURRENT}, newer than ${VERSION}; not downgrading."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "Pinned ${CURRENT} -> ${VERSION}"
             echo "skip=false" >> "$GITHUB_OUTPUT"
