@@ -118,7 +118,7 @@ jobs:
       - name: Collect .rpm assets
         id: assets
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ steps.rel.outputs.repo }}
           TAG: ${{ steps.rel.outputs.tag }}
           RPM_VERSION: ${{ steps.rel.outputs.rpm_version }}

@@ -492,7 +492,7 @@ jobs:
           REL_NAME: ${{ needs.preflight.outputs.releases_name }}
           NOTES_FILE: ${{ steps.notes.outputs.file }}
         with:
-          github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const { readFileSync } = require('node:fs');
             const { VERSION, PRERELEASE, APP_NAME, REL_OWNER, REL_NAME, NOTES_FILE } = process.env;
@@ -1119,7 +1119,7 @@ jobs:
       # release by tag_name, which is what lets this upload before publish.
       - name: Upload assets to the draft release
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ needs.preflight.outputs.releases_owner }}/${{ needs.preflight.outputs.releases_name }}
         run: |
           set -euo pipefail
@@ -1201,7 +1201,7 @@ jobs:
 
       - name: Generate, sign and upload SHA256SUMS
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ needs.preflight.outputs.releases_owner }}/${{ needs.preflight.outputs.releases_name }}
           TAG: ${{ needs.preflight.outputs.version }}
           SIGNING: ${{ steps.sign.outputs.signing }}
@@ -1256,7 +1256,7 @@ jobs:
     steps:
       - name: Download SHA256SUMS
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ needs.preflight.outputs.releases_owner }}/${{ needs.preflight.outputs.releases_name }}
           TAG: ${{ needs.preflight.outputs.version }}
         run: |
@@ -1314,7 +1314,7 @@ jobs:
           SIGNING: ${{ needs.preflight.outputs.signing }}
           ZSYNC: ${{ inputs.appimage_update_info != '' }}
         with:
-          github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const { RELEASE_ID, REL_OWNER, REL_NAME, BARE, PRODUCT, TARGETS, FORMATS, SIGNING, ZSYNC } = process.env;
             const owner = REL_OWNER;
@@ -1474,7 +1474,7 @@ jobs:
           REL_OWNER: ${{ needs.preflight.outputs.releases_owner }}
           REL_NAME: ${{ needs.preflight.outputs.releases_name }}
         with:
-          github-token: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             await github.rest.repos.updateRelease({
               owner: process.env.REL_OWNER, repo: process.env.REL_NAME,
