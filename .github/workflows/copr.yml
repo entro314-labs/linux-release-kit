@@ -104,8 +104,9 @@ jobs:
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
-            # Mirrors release.yml's RPM filename scheme (prerelease '-' → '~').
-            echo "rpm_version=${VERSION//-/\~}"
+            # Mirrors release.yml's RPM filename scheme (prerelease '-' → '.',
+            # as GitHub stores a '~'; the package header keeps the tilde).
+            echo "rpm_version=${VERSION//-/.}"
             echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
           } >> "$GITHUB_OUTPUT"
 

@@ -289,9 +289,11 @@ Every downstream workflow matches on these exact names; they are built from
 | Checksums | `SHA256SUMS`, `SHA256SUMS.asc`, `<FPR>.asc` | |
 | SBOM (source-level, one per release) | `<product>_<ver>.spdx.json`, `<product>_<ver>.cdx.json` | |
 
-A prerelease `1.0.0-beta.1` keeps its dash in the `.deb`/AppImage names and
-uses RPM's tilde form in the `.rpm` (`1.0.0~beta.1`, which sorts *before*
-`1.0.0` as it should). The Arch `pkgver` deletes the hyphens
+A prerelease `1.0.0-beta.1` keeps its dash in the `.deb`/AppImage names. The
+`.rpm` carries RPM's tilde form in its header (`Version: 1.0.0~beta.1`, which
+sorts *before* `1.0.0` as it should), but its filename uses a dot
+(`<product>-1.0.0.beta.1-1.x86_64.rpm`): GitHub rewrites `~` in an asset name
+to `.`, and the kit names the file the way it will be stored. The Arch `pkgver` deletes the hyphens
 (`1.0.0beta.1` — see "The Arch story" for why not underscores), the AUR
 follows the same rule, the Snap Store channel maps to `beta`, and GitHub
 marks the release as a prerelease.

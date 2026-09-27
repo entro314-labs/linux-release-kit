@@ -827,10 +827,12 @@ jobs:
           KEY_ID: ${{ steps.linux_sign.outputs.key_id }}
         run: |
           set -euo pipefail
-          # RPM forbids '-' in Version; nfpm moves a semver prerelease into
-          # the Release field itself. The FILENAME mirrors that with the
-          # tilde form RPM sorts correctly (1.0.0~beta.1 < 1.0.0).
-          RPM_VERSION="${RK_VERSION//-/\~}"
+          # RPM forbids '-' in Version; nfpm writes a semver prerelease as
+          # Version: 1.0.0~beta.1, which RPM sorts before 1.0.0. The FILENAME
+          # cannot carry the '~': GitHub stores it as '.', so an asset named
+          # with it is not found under its own name. The filename uses '.'
+          # from the start; the header keeps the tilde.
+          RPM_VERSION="${RK_VERSION//-/.}"
           OUT="${DIST}/${RK_PRODUCT}-${RPM_VERSION}-1.${RK_RPM_ARCH}.rpm"
           nfpm package --config "$NFPM_CONFIG" --packager rpm --target "$OUT"
           if [ "$SIGNING" = "true" ]; then
@@ -1322,7 +1324,8 @@ jobs:
               'linux-x86_64':  { arch: 'x86_64',  deb: 'amd64', rpm: 'x86_64' },
               'linux-aarch64': { arch: 'aarch64', deb: 'arm64', rpm: 'aarch64' },
             };
-            const rpmVersion = BARE.replace(/-/g, '~');
+            // '.' as GitHub stores it — see "Package .rpm".
+            const rpmVersion = BARE.replace(/-/g, '.');
             const archPkgver = BARE.replace(/-/g, '');
             const expected = [];
             for (const t of TARGETS.split(',')) {
