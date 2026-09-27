@@ -44,7 +44,7 @@ the kit reference.
 
 **Pinning.** Reference the kit at a reviewed commit SHA
 (`…/release.yml@<sha>`), not `@main`: the workflow runs with
-`contents: write` and your signing key. Bump all five references in an app
+`contents: write` and your signing key. Bump all six references in an app
 together.
 
 ### Distribution channels
