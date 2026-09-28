@@ -21,11 +21,12 @@
 #     root whose release profile builds `target/<triple>/release/<binary>`;
 #     a rust-toolchain.toml is honored if present
 #
-# THE GLIBC RULE: every leg builds on ubuntu-22.04 by default (runner_x86_64 /
+# THE GLIBC RULE: every leg builds on ubuntu-24.04 by default (runner_x86_64 /
 # runner_aarch64). glibc is forward-compatible only — a binary built on a
 # newer image dies on older distros with "GLIBC_2.xx not found", and the
 # AppImage does NOT bundle glibc. Raise the baseline deliberately, never by
-# following `ubuntu-latest`. Flatpak and Snap are exempt (they ship their own
+# following `ubuntu-latest`. 24.04 means glibc 2.39: Ubuntu 24.04+, Debian 13+,
+# Fedora 40+, RHEL 10+. Flatpak and Snap are exempt (they ship their own
 # runtime), which is why those workflows run on newer images.
 #
 # SIGNING is optional and degrades gracefully: no LINUX_GPG_PRIVATE_KEY ships
@@ -218,12 +219,12 @@ on:
         description: 'Runner label for the x86_64 leg. This IS the glibc baseline — see the header.'
         required: false
         type: string
-        default: 'ubuntu-22.04'
+        default: 'ubuntu-24.04'
       runner_aarch64:
         description: 'Runner label for the aarch64 leg (GitHub-hosted ARM runners are free on public repos).'
         required: false
         type: string
-        default: 'ubuntu-22.04-arm'
+        default: 'ubuntu-24.04-arm'
     secrets:
       RELEASES_TOKEN:
         description: >-
@@ -557,8 +558,9 @@ jobs:
       # cache action reported "installing 12 packages... done" while
       # installing ZERO, and the build died ten minutes later. A release must
       # fail loudly at the install step.
-      #   libfuse2 — linuxdeploy is itself an AppImage and needs FUSE2 to run
-      #     (libfuse2t64 on 24.04 images, should the baseline be raised)
+      #   libfuse2t64 — linuxdeploy is itself an AppImage and needs FUSE2 to
+      #     run; 24.04 renamed libfuse2 for the 64-bit time_t transition.
+      #     The libfuse2 fallback serves a caller that pins a 22.04 runner.
       #   rpm — rpmsign + signature verification; nfpm writes RPMs itself
       #   gettext-base — envsubst for binary_path
       #   desktop-file-utils — validates the .desktop before it ships
@@ -573,7 +575,7 @@ jobs:
           # Unquoted on purpose: apt_packages is a space-separated list.
           # shellcheck disable=SC2086
           sudo apt-get install -y rpm gettext-base desktop-file-utils file zstd $APT_PACKAGES
-          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
 
       - name: Setup Rust
         if: inputs.rust

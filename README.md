@@ -51,7 +51,7 @@ together.
 
 | Channel | Built from | Wired by | Signed by |
 | --- | --- | --- | --- |
-| Direct download (`.deb` / `.rpm` / AppImage / `.pkg.tar.zst`) | source, on ubuntu-22.04 | `release.yml` | you (GPG) |
+| Direct download (`.deb` / `.rpm` / AppImage / `.pkg.tar.zst`) | source, on ubuntu-24.04 | `release.yml` | you (GPG) |
 | Flathub / Flatpak bundle | the released `.deb` | `flatpak.yml` | Flathub |
 | Self-hosted pacman repository | the released `.pkg.tar.zst`, re-served | `arch-repo.yml` | you (GPG) |
 | Arch User Repository | the released `.deb` | `aur.yml` | — (sha256 pins) |
@@ -90,10 +90,18 @@ sorts after it, i.e. a beta would out-rank the stable release).
 The one constraint that shapes this kit: glibc is forward-compatible only.
 A binary built on Ubuntu 24.04 dies on 22.04 with `GLIBC_2.39 not found`,
 and the AppImage bundles everything *except* glibc. So `release.yml` builds
-on **`ubuntu-22.04` / `ubuntu-22.04-arm`** (glibc 2.35 — Ubuntu 22.04+,
-Debian 12+, Fedora 36+, RHEL 9+) and exposes that as the `runner_x86_64` /
+on **`ubuntu-24.04` / `ubuntu-24.04-arm`** (glibc 2.39 — Ubuntu 24.04+,
+Debian 13+, Fedora 40+, RHEL 10+) and exposes that as the `runner_x86_64` /
 `runner_aarch64` inputs. Raise the baseline deliberately. Never point them at
 `ubuntu-latest`.
+
+The baseline was glibc 2.35 (`ubuntu-22.04`) until GitHub began retiring
+that image (deprecation from 2026-09-17, removal 2027-04-17, brownouts
+before it). Moving to 24.04 drops Ubuntu 22.04, Debian 12 and RHEL 9 for the
+direct downloads, the AUR and COPR packages; Flatpak and Snap users are not
+affected. An app that must keep those distros can still pass
+`runner_x86_64: ubuntu-22.04` / `runner_aarch64: ubuntu-22.04-arm` until the
+image is gone.
 
 Flatpak and Snap are exempt — they link against their own runtime — which is
 why those workflows run on newer images. The AUR and COPR repacks inherit

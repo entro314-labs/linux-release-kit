@@ -79,10 +79,10 @@ jobs:
       #     that job. (Workflow default: 'deb,rpm,appimage'.)
       formats: 'deb,rpm,appimage,arch'
       # targets: 'linux-x86_64,linux-aarch64'
-      # --- glibc baseline (optional). ubuntu-22.04 = glibc 2.35. Raise it
+      # --- glibc baseline (optional). ubuntu-24.04 = glibc 2.39. Raise it
       #     deliberately; never point these at ubuntu-latest.
-      # runner_x86_64: 'ubuntu-22.04'
-      # runner_aarch64: 'ubuntu-22.04-arm'
+      # runner_x86_64: 'ubuntu-24.04'
+      # runner_aarch64: 'ubuntu-24.04-arm'
       # --- Cross-repo publishing (REQUIRED for private app repos: private
       #     release assets 404 anonymously, and the AUR/COPR/Flatpak recipes
       #     download them anonymously). Needs the RELEASES_TOKEN secret.
