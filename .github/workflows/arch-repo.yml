@@ -366,6 +366,16 @@ jobs:
                 rm -f "${STAGE}/${ARCH}/${OLD}" "${STAGE}/${ARCH}/${OLD}.sig"
               done <<<"$PRUNE"
 
+              # A signature whose file is gone (a .old database repo-add has
+              # since removed, a package pruned by another publisher) is noise
+              # that verifies nothing.
+              find "${STAGE}/${ARCH}/" -maxdepth 1 -type f -name '*.sig' -printf '%f\n' \
+                | while read -r SIG; do
+                    [ -e "${STAGE}/${ARCH}/${SIG%.sig}" ] && continue
+                    echo "Removing orphan signature ${ARCH}/${SIG}"
+                    rm -f "${STAGE}/${ARCH}/${SIG}"
+                  done
+
               # repo-add appends to / replaces in the EXISTING database, so
               # other apps' entries survive. It runs in a real Arch container
               # because repo-add is pacman's own script, not something to
