@@ -128,7 +128,7 @@ jobs:
       repo_name: 'myrepo'              # ← the [section] users add to pacman.conf; shared by all your apps
       pages_repo: 'my-org/arch-repo'   # ← public repo with GitHub Pages on pages_branch
       # pages_branch: 'main'
-      # keep: '2'                      # ← superseded versions kept for rollback
+      # keep: '1'                      # ← superseded versions kept for rollback
       # dry_run: true                  # ← stage + validate without pushing
     secrets: inherit
 

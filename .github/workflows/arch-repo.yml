@@ -91,10 +91,12 @@ on:
           How many SUPERSEDED versions of this package to keep per
           architecture for rollback, besides the one being published. Older
           files (and their .sig) are pruned; the database only ever points at
-          the newest, so pruning never breaks an install.
+          the newest, so pruning never breaks an install. One by default:
+          a GitHub Pages site may not exceed 1 GB, and every retained version
+          of every package on both architectures counts against it.
         required: false
         type: string
-        default: '2'
+        default: '1'
       dry_run:
         description: 'Stage and validate the repository but do not push to pages_repo'
         required: false
