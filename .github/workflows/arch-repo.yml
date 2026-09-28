@@ -385,9 +385,10 @@ jobs:
                 cd /repo
                 rm -f '${REPO_NAME}.db' '${REPO_NAME}.files'
                 repo-add '${REPO_NAME}.db.tar.gz' '${PRODUCT}-${PKGVER}-1-${ARCH}.pkg.tar.zst'
-                # repo-add leaves symlinked names and .old backups; git and
-                # GitHub Pages want real files and no churn.
-                rm -f '${REPO_NAME}.db' '${REPO_NAME}.files' ./*.old
+                # repo-add leaves symlinked names, .old backups and, when the
+                # database was signed, the old signature renamed to .old.sig;
+                # git and GitHub Pages want real files and no churn.
+                rm -f '${REPO_NAME}.db' '${REPO_NAME}.files' ./*.old ./*.old.sig
                 cp '${REPO_NAME}.db.tar.gz' '${REPO_NAME}.db'
                 cp '${REPO_NAME}.files.tar.gz' '${REPO_NAME}.files'
               "
