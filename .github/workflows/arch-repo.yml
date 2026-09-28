@@ -406,6 +406,17 @@ jobs:
             if [ "$SIGNING" = "true" ]; then
               gpg --armor --export "$KEY_ID" > "${STAGE}/${REPO_NAME}.asc"
             fi
+
+            # GitHub Pages refuses to deploy a site over 1 GB, and it refuses
+            # after the push has succeeded: the job goes green while the
+            # served database stays at the last deploy that fit. Fail here
+            # instead, while the cause is on screen. 950 MiB leaves room for
+            # the pages build itself.
+            SITE_BYTES="$(du -sb --exclude=.git "$STAGE" | cut -f1)"
+            if [ "$SITE_BYTES" -gt $((950 * 1024 * 1024)) ]; then
+              echo "::error::The staged ${PAGES_REPO} tree is $((SITE_BYTES / 1024 / 1024)) MiB; GitHub Pages will not deploy a site over 1 GB. Lower 'keep' or prune old packages before publishing."
+              exit 1
+            fi
           }
 
           # Subshell body ON PURPOSE: a retry's stage_repo does rm -rf on
