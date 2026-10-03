@@ -579,8 +579,13 @@ jobs:
 
       - name: Setup Rust
         if: inputs.rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        # Pinned on master with the channel as an input. The action's
+        # `stable` branch is rebuilt on every Rust release, so a commit pinned
+        # from it drops out of the repository's history within weeks — still
+        # fetchable by hash, but no longer provably the action's own code.
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
