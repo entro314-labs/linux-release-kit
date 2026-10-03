@@ -469,7 +469,14 @@ jobs:
           # Push, and on a rejected push (another app released into the same
           # hosting repo mid-run) re-stage from the remote's new state so
           # repo-add runs against THEIR database, then try again.
-          ATTEMPTS=3
+          #
+          # Eight attempts, each after a random pause: a suite that releases
+          # all its apps in one go puts that many jobs on this one branch, and
+          # every re-stage takes a minute or two in which the others push.
+          # Three attempts in lockstep lost that race (one of nine releases
+          # failed here); the jitter is what stops the losers colliding with
+          # each other again on the next round.
+          ATTEMPTS=8
           for i in $(seq 1 "$ATTEMPTS"); do
             if push_repo; then
               OWNER="${PAGES_REPO%%/*}"; NAME="${PAGES_REPO##*/}"
@@ -477,7 +484,9 @@ jobs:
               exit 0
             fi
             if [ "$i" -lt "$ATTEMPTS" ]; then
-              echo "::warning::Push to ${PAGES_REPO} rejected (concurrent release?) — re-staging from the updated remote (attempt $((i + 1))/${ATTEMPTS})"
+              PAUSE=$(( RANDOM % 45 ))
+              echo "::warning::Push to ${PAGES_REPO} rejected (concurrent release?) — re-staging from the updated remote in ${PAUSE}s (attempt $((i + 1))/${ATTEMPTS})"
+              sleep "$PAUSE"
               stage_repo
             fi
           done
