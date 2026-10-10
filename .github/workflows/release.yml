@@ -583,7 +583,7 @@ jobs:
         # `stable` branch is rebuilt on every Rust release, so a commit pinned
         # from it drops out of the repository's history within weeks — still
         # fetchable by hash, but no longer provably the action's own code.
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
