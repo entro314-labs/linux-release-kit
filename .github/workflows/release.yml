@@ -591,7 +591,7 @@ jobs:
 
       - name: Cache Rust workspace
         if: inputs.rust
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ inputs.rust_workspace_dir }}
           shared-key: ${{ matrix.target }}
@@ -1153,7 +1153,7 @@ jobs:
 
       - name: Install Syft
         id: syft
-        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           # The action's default (1.51.1) predates the fix for GHSA-mw2c-m758-9v5q.
           syft-version: v1.52.0
