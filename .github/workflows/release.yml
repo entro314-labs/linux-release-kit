@@ -1260,6 +1260,11 @@ jobs:
       contents: write        # SHA256SUMS is read from the still-draft release
       id-token: write        # Sigstore signing certificate
       attestations: write    # store the attestation on this repository
+    # The step below is continue-on-error, so this job's `result` is success
+    # even when no attestation was made; the step's own outcome is what the
+    # verification summary reports.
+    outputs:
+      attested: ${{ steps.attest.outcome }}
     steps:
       - name: Download SHA256SUMS
         env:
@@ -1300,7 +1305,16 @@ jobs:
   # upload, and an asset re-uploaded (by a retried leg) after the checksums
   # job ran, which would otherwise publish a SHA256SUMS the file fails.
   verify-release:
-    needs: [preflight, plan, create-release, build, checksums]
+    needs: [preflight, plan, create-release, build, checksums, attest]
+    # attest is a need only so its outcome can go on the summary: it may fail
+    # (a plan limit, see that job) and verification must still run and say
+    # so. The explicit success checks keep every other need as blocking as
+    # before, and publish-release still needs both this job and attest.
+    if: >-
+      ${{ !cancelled()
+        && needs.preflight.result == 'success' && needs.plan.result == 'success'
+        && needs.create-release.result == 'success' && needs.build.result == 'success'
+        && needs.checksums.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Draft releases are invisible to a read-only token, so reading one needs write.
@@ -1448,6 +1462,9 @@ jobs:
           ASSET_COUNT: ${{ steps.verify.outputs.asset_count }}
           CHECKS: ${{ steps.verify.outputs.checks }}
           OUTCOME: ${{ steps.verify.outcome }}
+          # The step outcome when the attest job got that far, else the job
+          # result (it failed before attesting, e.g. SHA256SUMS not found).
+          ATTESTATION: ${{ needs.attest.outputs.attested || needs.attest.result }}
         run: |
           {
             echo "## Release verification: ${VERSION}"
@@ -1458,6 +1475,7 @@ jobs:
             echo "| Release (draft) | ${HTML_URL:-https://github.com/${REL_OWNER}/${REL_NAME}/releases} |"
             echo "| Assets | ${ASSET_COUNT:-unknown} |"
             echo "| Verification | ${OUTCOME} |"
+            echo "| Attestation (non-blocking) | ${ATTESTATION} |"
             if [ -n "${CHECKS:-}" ]; then
               echo
               echo "| Check | Result | Detail |"
@@ -1558,6 +1576,8 @@ jobs:
           REL_NAME: ${{ needs.preflight.outputs.releases_name }}
           PUBLISH: ${{ steps.publish.outcome }}
           PUBLIC_URL: ${{ steps.public_url.outcome }}
+          # Same source as the verification summary's row.
+          ATTESTATION: ${{ needs.attest.outputs.attested || needs.attest.result }}
         run: |
           {
             echo "## Publish: ${VERSION}"
@@ -1566,6 +1586,7 @@ jobs:
             echo "| --- | --- |"
             echo "| Draft flipped to published | ${PUBLISH} |"
             echo "| SHA256SUMS reachable anonymously | ${PUBLIC_URL} |"
+            echo "| Attestation (non-blocking) | ${ATTESTATION} |"
             echo
             echo "Release: https://github.com/${REL_OWNER}/${REL_NAME}/releases/tag/${VERSION}"
           } >> "$GITHUB_STEP_SUMMARY"
