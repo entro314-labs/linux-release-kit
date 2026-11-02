@@ -155,7 +155,11 @@ the baseline from the `.deb`/`.rpm`.
    `target/$RK_TARGET/release/$RK_BINARY`, with fmt + clippy gates before
    the build. Anything else: `rust: false` plus your own `build_command` /
    `binary_path`. Build-time `-dev` packages go in `apt_packages`; runtime
-   dependencies go in `nfpm.yaml`. These variables are exported to
+   dependencies go in `nfpm.yaml`. The GPG key is imported — and its
+   passphrase preset — *before* `build_command` runs, so a bad key fails
+   fast; it also means the build and every script it invokes can sign with
+   the key, so treat them as trusted release code (see
+   [docs/SIGNING.md](docs/SIGNING.md)). These variables are exported to
    `build_command`, `binary_path` and `nfpm.yaml` alike:
 
    | Variable | x86_64 leg | aarch64 leg |

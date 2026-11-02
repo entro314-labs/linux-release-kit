@@ -96,6 +96,20 @@ platform level, which is what most users actually rely on.
   - checks the AppImage with `--appimage-signature` (advisory: a missing
     signature here is a warning, since appimagetool already failed the
     build on a real signing error).
+
+  That order is deliberate — a bad key must fail in seconds, not after a
+  long compile — and it has a consequence: from the import step on, the
+  private key sits in the runner's gpg keyring with its passphrase preset in
+  gpg-agent, and `SIGN_KEY` plus `APPIMAGETOOL_SIGN_PASSPHRASE` (the
+  passphrase itself) are in `GITHUB_ENV`, all of it **before `build_command`
+  runs**. The build and everything it executes — `build.rs`, proc-macros,
+  dependency build scripts, a Makefile, an `npm` hook — can therefore sign
+  with the key or read the passphrase. Treat build scripts as trusted
+  release code (`--locked` and a reviewed lockfile are part of that trust
+  boundary), and never give the release workflow an untrusted trigger: the
+  template runs it on tag pushes and manual dispatch only, and a
+  `pull_request` trigger on a caller would hand the key to every
+  contributor's branch.
 - **Checksums job** → downloads every asset on the draft, writes
   `SHA256SUMS`, signs it, verifies the signature, uploads both plus
   `<FPR>.asc`.
