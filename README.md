@@ -49,14 +49,18 @@ together.
 
 ### Distribution channels
 
-| Channel | Built from | Wired by | Signed by |
-| --- | --- | --- | --- |
-| Direct download (`.deb` / `.rpm` / AppImage / `.pkg.tar.zst`) | source, on ubuntu-24.04 | `release.yml` | you (GPG) |
-| Flathub / Flatpak bundle | the released `.deb` | `flatpak.yml` | Flathub |
-| Self-hosted pacman repository | the released `.pkg.tar.zst`, re-served | `arch-repo.yml` | you (GPG) |
-| Arch User Repository | the released `.deb` | `aur.yml` | — (sha256 pins) |
-| Fedora COPR | the released `.rpm` | `copr.yml` | COPR |
-| Snap Store | the released `.deb` | `snap.yml` | Canonical |
+| Channel | Built from | Wired by | Signed by | Prereleases (`v1.2.3-beta.1`) |
+| --- | --- | --- | --- | --- |
+| Direct download (`.deb` / `.rpm` / AppImage / `.pkg.tar.zst`) | source, on ubuntu-24.04 | `release.yml` | you (GPG) | published, marked prerelease, never `latest` |
+| Flathub / Flatpak bundle | the released `.deb` | `flatpak.yml` | Flathub | bundle attached to the (pre)release |
+| Self-hosted pacman repository | the released `.pkg.tar.zst`, re-served | `arch-repo.yml` | you (GPG) | **skipped** — stable only |
+| Arch User Repository | the released `.deb` | `aur.yml` | — (sha256 pins) | own package, `aur_prerelease_package`; else skipped |
+| Fedora COPR | the released `.rpm` | `copr.yml` | COPR | own project, `copr_prerelease_project`; else skipped |
+| Snap Store | the released `.deb` | `snap.yml` | Canonical | `candidate` / `beta` / `edge` channel |
+
+A prerelease never reaches a stable user's `pacman -Syu` or `dnf upgrade`:
+the channels that feed those commands either carry prereleases under a
+separate name users opt into, or skip them with a notice.
 
 Not included, on purpose: a Launchpad PPA (needs full `debian/` source
 packaging and vendored dependencies for reach the `.deb` + Flatpak + Snap
@@ -79,11 +83,28 @@ Arch users get three doors, in order of preference:
 3. **The AUR** (`aur.yml`) — the discovery listing, for when the AUR is
    open. Leave the job wired with `dry_run: true` (or without the SSH key):
    it validates every release and publishes the day you flip it on.
+   Prereleases go out as their own package, `aur_prerelease_package`
+   (`myapp-beta-bin`): it `provides` the plain name and `conflicts` with the
+   stable `-bin` package, so a machine holds one or the other, never both,
+   and a stable install is never upgraded to a beta. Without that input a
+   prerelease tag skips the AUR with a notice.
 
 One version rule binds all three: Arch forbids `-` in `pkgver`, and the
 hyphens are **deleted**, not underscored — `1.2.3-beta.1` becomes
 `1.2.3beta.1`, which `vercmp` sorts *before* `1.2.3` (the underscore form
 sorts after it, i.e. a beta would out-rank the stable release).
+
+The pacman repository carries **stable releases only** and skips a
+prerelease tag with a notice. It cannot serve a beta under a second name
+without a second build: `pkgname` is baked into the `.pkg.tar.zst`'s
+`.PKGINFO` by nfpm at package time, and rewriting it means re-tarring a file
+whose `.sig` and `SHA256SUMS` line cover the original bytes — the "bytes
+users get are the bytes on the release" rule would be gone. Under the stable
+name it would reach every `pacman -Syu` user. The beta routes for Arch users
+are therefore the AUR package above and door 2: `pacman -U <release-url>` of
+the prerelease `.pkg.tar.zst` the release still carries, which installs
+under the stable `pkgname` at a version `vercmp` puts below the stable
+release it precedes, so that release upgrades it normally.
 
 ## The glibc rule
 
@@ -160,11 +181,18 @@ the baseline from the `.deb`/`.rpm`.
      the manifest the workflow emits as an artifact
    - pacman repo: `ARCH_REPO_TOKEN` (fine-grained PAT, Contents:RW on the
      hosting repo) after the one-time hosting-repo setup in the
-     [`arch-repo.yml`](.github/workflows/arch-repo.yml) header
-   - AUR: `AUR_SSH_PRIVATE_KEY` (public half registered on your AUR account)
+     [`arch-repo.yml`](.github/workflows/arch-repo.yml) header; stable
+     releases only
+   - AUR: `AUR_SSH_PRIVATE_KEY` (public half registered on your AUR account);
+     to publish prereleases, `aur_prerelease_package` (see "The Arch story")
    - COPR: `COPR_API_CONFIG` (the config file from
      copr.fedorainfracloud.org/api, pasted whole); create the project and
-     enable its x86_64/aarch64 chroots first
+     enable its x86_64/aarch64 chroots first. Prereleases are built in a
+     second project, `copr_prerelease_project` (same chroots), that users
+     enable separately; the package keeps its name — the project is the
+     boundary, since each one is its own repository and a stable user never
+     enabled the beta one. Without that input a prerelease tag skips COPR
+     with a notice.
    - Snap: `SNAPCRAFT_STORE_CREDENTIALS` (`snapcraft export-login`), after
      `snapcraft register <name>`; plus `snap/snapcraft.yaml` from
      [`templates/snapcraft.yaml`](templates/snapcraft.yaml)
@@ -303,8 +331,9 @@ sorts *before* `1.0.0` as it should), but its filename uses a dot
 (`<product>-1.0.0.beta.1-1.x86_64.rpm`): GitHub rewrites `~` in an asset name
 to `.`, and the kit names the file the way it will be stored. The Arch `pkgver` deletes the hyphens
 (`1.0.0beta.1` — see "The Arch story" for why not underscores), the AUR
-follows the same rule, the Snap Store channel maps to `beta`, and GitHub
-marks the release as a prerelease.
+follows the same rule under its own package name, the Snap Store channel
+maps to `beta`, and GitHub marks the release as a prerelease. Which channels
+carry a prerelease at all is in the channel table.
 
 ## Nix package updates (optional template)
 

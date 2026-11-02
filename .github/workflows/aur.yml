@@ -17,6 +17,13 @@
 # VALIDATES the PKGBUILD (checksums, sources, .SRCINFO, namcap) and uploads it
 # as an artifact — it just does not push. That is the recommended way to run
 # this the first few times.
+#
+# PRERELEASES never go out under the stable package name: a user who installed
+# `myapp-bin` must not receive a beta from the AUR helper's next upgrade. A
+# prerelease tag publishes under `aur_prerelease_package` (e.g.
+# `myapp-beta-bin`) — a package that `provides` the plain name and `conflicts`
+# with the stable one, so the two never coexist — and is SKIPPED with a notice
+# when that input is empty.
 
 name: AUR (reusable)
 
@@ -25,11 +32,20 @@ on:
     inputs:
       pkgname:
         description: >-
-          Exact AUR package name, INCLUDING the `-bin` suffix Arch requires for
-          prebuilt binaries (e.g. `myapp-bin`). The AUR repository of this name
-          is created by the first push.
+          Exact AUR package name for STABLE releases, INCLUDING the `-bin`
+          suffix Arch requires for prebuilt binaries (e.g. `myapp-bin`). The
+          AUR repository of this name is created by the first push.
         required: true
         type: string
+      aur_prerelease_package:
+        description: >-
+          AUR package name for PRERELEASE tags (e.g. `myapp-beta-bin`, again
+          with the `-bin` suffix). It provides the plain name and conflicts
+          with `pkgname`, so a stable install is never upgraded to a beta.
+          Empty = prerelease tags skip the AUR with a notice.
+        required: false
+        type: string
+        default: ''
       product_name:
         description: 'The .deb filename stem (release.yml product_name)'
         required: true
@@ -130,6 +146,8 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           RELEASES_REPO: ${{ inputs.releases_repo }}
+          STABLE_PKGNAME: ${{ inputs.pkgname }}
+          PRERELEASE_PKGNAME: ${{ inputs.aur_prerelease_package }}
         run: |
           set -euo pipefail
           TAG="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
@@ -146,10 +164,34 @@ jobs:
           # arch-repo.yml, or the AUR package and the pacman repo disagree on
           # what version an upgrade is.
           PKGVER="${VERSION//-/}"
+          # A semver suffix is a prerelease, and a prerelease gets its own
+          # package name or no AUR package at all (see the header). The same
+          # name for both is a half-configured channel: fail, do not degrade.
+          PRERELEASE=false
+          PKGNAME="$STABLE_PKGNAME"
+          SKIP=false
+          case "$VERSION" in
+            *-*)
+              PRERELEASE=true
+              if [ "$PRERELEASE_PKGNAME" = "$STABLE_PKGNAME" ]; then
+                echo "::error::aur_prerelease_package equals pkgname ('${STABLE_PKGNAME}') — a prerelease must not publish under the stable package name"
+                exit 1
+              fi
+              if [ -n "$PRERELEASE_PKGNAME" ]; then
+                PKGNAME="$PRERELEASE_PKGNAME"
+              else
+                SKIP=true
+                echo "::notice::${TAG} is a prerelease and aur_prerelease_package is not set — skipping the AUR (${STABLE_PKGNAME} stays on its stable release). Set the input to publish prereleases as their own package."
+              fi
+              ;;
+          esac
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
             echo "pkgver=$PKGVER"
+            echo "prerelease=$PRERELEASE"
+            echo "pkgname=$PKGNAME"
+            echo "skip=$SKIP"
             echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
           } >> "$GITHUB_OUTPUT"
 
@@ -157,6 +199,7 @@ jobs:
       # is byte-accurate by construction rather than by hand-editing.
       - name: Collect .deb assets
         id: assets
+        if: steps.rel.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ steps.rel.outputs.repo }}
@@ -199,8 +242,11 @@ jobs:
 
       - name: Render PKGBUILD
         id: render
+        if: steps.rel.outputs.skip != 'true'
         env:
-          PKGNAME: ${{ inputs.pkgname }}
+          PKGNAME: ${{ steps.rel.outputs.pkgname }}
+          STABLE_PKGNAME: ${{ inputs.pkgname }}
+          PRERELEASE: ${{ steps.rel.outputs.prerelease }}
           PKGDESC: ${{ inputs.pkgdesc }}
           PKGVER: ${{ steps.rel.outputs.pkgver }}
           PKGREL: ${{ inputs.pkgrel }}
@@ -222,6 +268,16 @@ jobs:
 
           quote_list() { for w in $1; do printf "'%s' " "$w"; done; }
           BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+
+          # The prerelease package stands in for the plain name like the
+          # stable one does, and conflicts with the stable package so pacman
+          # never holds both — on top of whatever the caller declared.
+          if [ "$PRERELEASE" = "true" ]; then
+            case " $PROVIDES " in *" ${STABLE_PKGNAME%-bin} "*) ;; *) PROVIDES="${PROVIDES} ${STABLE_PKGNAME%-bin}" ;; esac
+            case " $CONFLICTS " in *" ${STABLE_PKGNAME} "*) ;; *) CONFLICTS="${CONFLICTS} ${STABLE_PKGNAME}" ;; esac
+            PROVIDES="${PROVIDES# }"
+            CONFLICTS="${CONFLICTS# }"
+          fi
 
           {
             if [ -n "${MAINTAINER:-}" ]; then printf '# Maintainer: %s\n' "$MAINTAINER"; fi
@@ -293,9 +349,10 @@ jobs:
       # sha256sums: it catches a wrong URL or a stale checksum HERE, instead of
       # in the inbox of every Arch user whose update just failed.
       - name: Validate in an Arch container
+        if: steps.rel.outputs.skip != 'true'
         env:
           WORK: ${{ steps.render.outputs.workdir }}
-          PKGNAME: ${{ inputs.pkgname }}
+          PKGNAME: ${{ steps.rel.outputs.pkgname }}
         run: |
           set -euo pipefail
           docker run --rm -v "${WORK}:/pkg" archlinux:base-devel bash -euo pipefail -c '
@@ -321,11 +378,11 @@ jobs:
 
       - name: Push to the AUR
         id: push
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && steps.rel.outputs.skip != 'true' }}
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           WORK: ${{ steps.render.outputs.workdir }}
-          PKGNAME: ${{ inputs.pkgname }}
+          PKGNAME: ${{ steps.rel.outputs.pkgname }}
           PKGVER: ${{ steps.rel.outputs.pkgver }}
           MAINTAINER: ${{ inputs.maintainer }}
         run: |
@@ -375,11 +432,11 @@ jobs:
         if: always() && steps.render.outputs.workdir != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: aur-${{ inputs.pkgname }}
+          name: aur-${{ steps.rel.outputs.pkgname }}
           path: |
             ${{ steps.render.outputs.workdir }}/PKGBUILD
             ${{ steps.render.outputs.workdir }}/.SRCINFO
-            ${{ steps.render.outputs.workdir }}/${{ inputs.pkgname }}.install
+            ${{ steps.render.outputs.workdir }}/${{ steps.rel.outputs.pkgname }}.install
           # upload-artifact drops dotfiles by default, even ones named explicitly,
           # so without this the artifact never carried .SRCINFO.
           include-hidden-files: true

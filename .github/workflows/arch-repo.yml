@@ -39,6 +39,15 @@
 # repo. A rejected push triggers a full re-stage from the updated remote —
 # repo-add is re-run against the other app's fresh database — rather than a
 # rebase, which would silently drop one app's database entry.
+#
+# PRERELEASES are SKIPPED with a notice: this is the `pacman -Syu` channel,
+# and a beta here would reach every stable user. Publishing one under a
+# second name is not possible without a second build — pkgname is baked
+# into the .pkg.tar.zst's .PKGINFO by nfpm in release.yml, and rewriting it
+# means re-tarring a file whose .sig and SHA256SUMS line cover the original
+# bytes. The beta routes for Arch users are the AUR's `aur_prerelease_package`
+# and `pacman -U <release-url>` of the prerelease package the release
+# still carries.
 
 name: Pacman repo (reusable)
 
@@ -157,9 +166,19 @@ jobs:
           # Must match the arch step in release.yml: hyphens DELETED, so a
           # prerelease sorts before the stable release under vercmp.
           PKGVER="${VERSION//-/}"
+          # A semver suffix is a prerelease, and the repo carries none (see
+          # the header).
+          SKIP=false
+          case "$VERSION" in
+            *-*)
+              SKIP=true
+              echo "::notice::${TAG} is a prerelease — skipping the '${REPO_NAME}' pacman repo, which carries stable releases only. Arch users get prereleases from the AUR (aur_prerelease_package) or with pacman -U <release-url>."
+              ;;
+          esac
           {
             echo "tag=$TAG"
             echo "pkgver=$PKGVER"
+            echo "skip=$SKIP"
             echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
           } >> "$GITHUB_OUTPUT"
 
@@ -168,6 +187,7 @@ jobs:
       # artifact set users can already download by hand.
       - name: Collect .pkg.tar.zst assets
         id: assets
+        if: steps.rel.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ steps.rel.outputs.repo }}
@@ -224,6 +244,7 @@ jobs:
 
       - name: Import signing key
         id: sign
+        if: steps.rel.outputs.skip != 'true'
         env:
           LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
           LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
@@ -284,6 +305,7 @@ jobs:
       # tree — package installability does not change with a re-stage.
       - name: Stage, validate and publish
         id: publish
+        if: steps.rel.outputs.skip != 'true'
         env:
           ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
           PAGES_REPO: ${{ inputs.pages_repo }}

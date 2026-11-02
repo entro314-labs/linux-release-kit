@@ -117,6 +117,8 @@ jobs:
   #     AUR is not accepting submissions. One-time hosting-repo setup is in
   #     the arch-repo.yml header; needs the ARCH_REPO_TOKEN secret, without
   #     which the repo is still staged and validated, just not pushed.
+  #     Stable releases only: a prerelease tag skips this job with a notice
+  #     (the AUR job's aur_prerelease_package is the beta route for Arch).
   #     DELETE this job if you don't ship a pacman repo.
   arch-repo:
     needs: release
@@ -151,6 +153,10 @@ jobs:
       maintainer: 'Your Name <you@example.com>'
       provides: 'myapp'
       conflicts: 'myapp'
+      # --- Prereleases (v1.2.3-beta.1) publish as a SEPARATE package that
+      #     provides `myapp` and conflicts with `myapp-bin`, so a stable
+      #     install never upgrades to a beta. Without it they skip the AUR.
+      # aur_prerelease_package: 'myapp-beta-bin'
       # dry_run: true                  # ← validate without publishing
     secrets: inherit
 
@@ -166,6 +172,10 @@ jobs:
       releases_repo: 'my-org/myapp-releases'
       copr_project: 'your-fas-user/myapp'
       product_name: 'myapp'
+      # --- Prereleases (v1.2.3-beta.1) build in a SEPARATE project users
+      #     enable on purpose (create it with the same chroots). Without it
+      #     they skip COPR, so `dnf upgrade` never hands out a beta.
+      # copr_prerelease_project: 'your-fas-user/myapp-beta'
       # dry_run: true                  # ← validate without submitting
     secrets: inherit
 

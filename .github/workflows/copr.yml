@@ -20,9 +20,16 @@
 # still rendered, the SRPM built, and a real x86_64 RPM rebuilt from it in a
 # Fedora container — everything but the upload. Run it that way first.
 #
+# PRERELEASES never enter the stable project: a user who enabled it must not
+# get a beta from `dnf upgrade`. A prerelease tag is built in
+# `copr_prerelease_project` instead — a second project, i.e. a second
+# repository users opt into; the package keeps its name, the project is the
+# boundary — and is SKIPPED with a notice when that input is empty.
+#
 # ONE-TIME SETUP: create the project at https://copr.fedorainfracloud.org
 # (enable the x86_64 and aarch64 chroots you ship), then paste the contents
 # of https://copr.fedorainfracloud.org/api/ into the COPR_API_CONFIG secret.
+# A prerelease project needs the same chroots.
 
 name: COPR (reusable)
 
@@ -30,9 +37,18 @@ on:
   workflow_call:
     inputs:
       copr_project:
-        description: "COPR project as 'owner/project' or '@group/project'"
+        description: "COPR project for STABLE releases, as 'owner/project' or '@group/project'"
         required: true
         type: string
+      copr_prerelease_project:
+        description: >-
+          COPR project for PRERELEASE tags (e.g. 'owner/myapp-beta'), with the
+          same chroots enabled. Users opt into it separately, so a stable
+          install is never upgraded to a beta. Empty = prerelease tags skip
+          COPR with a notice.
+        required: false
+        type: string
+        default: ''
       product_name:
         description: 'The .rpm filename stem (release.yml product_name)'
         required: true
@@ -93,6 +109,8 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           RELEASES_REPO: ${{ inputs.releases_repo }}
+          STABLE_PROJECT: ${{ inputs.copr_project }}
+          PRERELEASE_PROJECT: ${{ inputs.copr_prerelease_project }}
         run: |
           set -euo pipefail
           TAG="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
@@ -101,22 +119,45 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
+          # A semver suffix is a prerelease, and a prerelease is built in its
+          # own project or not at all (see the header). The same project for
+          # both is a half-configured channel: fail, do not degrade.
+          PROJECT="$STABLE_PROJECT"
+          SKIP=false
+          case "$VERSION" in
+            *-*)
+              if [ "$PRERELEASE_PROJECT" = "$STABLE_PROJECT" ]; then
+                echo "::error::copr_prerelease_project equals copr_project ('${STABLE_PROJECT}') — a prerelease must not be built in the stable project"
+                exit 1
+              fi
+              if [ -n "$PRERELEASE_PROJECT" ]; then
+                PROJECT="$PRERELEASE_PROJECT"
+              else
+                SKIP=true
+                echo "::notice::${TAG} is a prerelease and copr_prerelease_project is not set — skipping COPR (${STABLE_PROJECT} stays on its stable release). Set the input to build prereleases in their own project."
+              fi
+              ;;
+          esac
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
             # Mirrors release.yml's RPM filename scheme (prerelease '-' → '.',
             # as GitHub stores a '~'; the package header keeps the tilde).
             echo "rpm_version=${VERSION//-/.}"
+            echo "project=$PROJECT"
+            echo "skip=$SKIP"
             echo "repo=${RELEASES_REPO:-$GITHUB_REPOSITORY}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install rpm tooling
+        if: steps.rel.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm
 
       - name: Collect .rpm assets
         id: assets
+        if: steps.rel.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ inputs.releases_repo != '' && secrets.RELEASES_TOKEN || github.token }}
           REPO: ${{ steps.rel.outputs.repo }}
@@ -160,6 +201,7 @@ jobs:
       # only thing that ever changes here.
       - name: Render the spec
         id: spec
+        if: steps.rel.outputs.skip != 'true'
         env:
           SOURCES: ${{ steps.assets.outputs.dir }}
           FOUND_ARCHES: ${{ steps.assets.outputs.arches }}
@@ -251,6 +293,7 @@ jobs:
       # principle, and its rules shift between releases.
       - name: Build and test the SRPM in a Fedora container
         id: srpm
+        if: steps.rel.outputs.skip != 'true'
         env:
           WORK: ${{ steps.spec.outputs.workdir }}
           SOURCES: ${{ steps.assets.outputs.dir }}
@@ -280,10 +323,10 @@ jobs:
           echo "path=$SRPM" >> "$GITHUB_OUTPUT"
 
       - name: Submit to COPR
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && steps.rel.outputs.skip != 'true' }}
         env:
           COPR_API_CONFIG: ${{ secrets.COPR_API_CONFIG }}
-          PROJECT: ${{ inputs.copr_project }}
+          PROJECT: ${{ steps.rel.outputs.project }}
           SRPM: ${{ steps.srpm.outputs.path }}
           WAIT: ${{ inputs.wait }}
         run: |
