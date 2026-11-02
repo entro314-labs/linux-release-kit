@@ -409,9 +409,27 @@ that matter:
 | **linux-release-kit** | non-Tauri Linux desktop apps | reusable workflows |
 | [go-release-kit](../go-release-kit) | Go CLIs | copy-in GoReleaser templates |
 
+### Shared with tauri-release-kit
+
 The Flatpak and AUR workflows here started as the tauri kit's and diverge
 only where the Tauri assumptions did (default runtime, default dependencies,
-asset lookup by exact name). Fixes to the shared logic belong in both.
+asset lookup by exact name). Beyond those two files the kits carry the same
+logic in several places, each hand-copied, none generated:
+
+- `aur.yml` — the prerelease `pkgver` rule (hyphens deleted so `vercmp`
+  sorts a beta below the stable release)
+- `flatpak.yml` — manifest generation, the binary lookup from the `.deb`,
+  and its `|| true` pipefail guard
+- `release.yml` — the semver `make_latest` guard in the publish step,
+  `RELEASES_TOKEN` used only when `releases_repo` is set, the RPM signature
+  check (`rpmkeys --dbpath`, one explicit keyring), the verify-release asset
+  contract and step summary, and the checksums / SBOM / attestation jobs
+- `templates/release.yml` — the concurrency group keyed on `github.ref_name`
+
+**A fix to any of them is ported both ways, in the same change.** The
+2026-09-27 audit found F-04 (AUR pkgver ordering), F-15 (`RELEASES_TOKEN`
+gating), F-18 (`make_latest`) and F-24 (the flatpak pipefail guard) were all
+fixes that had landed in one kit and not the other.
 
 ## License
 
