@@ -356,7 +356,14 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm -v "${WORK}:/pkg" archlinux:base-devel bash -euo pipefail -c '
-            pacman -Sy --noconfirm --needed pacman-contrib namcap >/dev/null 2>&1 || true
+            # namcap is advisory, so a failed install (mirror outage, package
+            # rename) must not fail the release — but it must not read as a
+            # lint result either: the lint is skipped and the run says so.
+            NAMCAP=true
+            pacman -Sy --noconfirm --needed pacman-contrib namcap >/dev/null 2>&1 || {
+              NAMCAP=false
+              echo "::warning::namcap could not be installed — PKGBUILD not linted"
+            }
             useradd -m builder
             cp -r /pkg /home/builder/pkg
             chown -R builder:builder /home/builder/pkg
@@ -371,7 +378,9 @@ jobs:
             echo "sources verified against sha256sums"
             # namcap is advisory: it flags style issues that are not release
             # blockers, and its rules change between versions.
-            su builder -c "namcap PKGBUILD" || echo "::warning::namcap reported PKGBUILD issues (above)"
+            if [ "$NAMCAP" = true ]; then
+              su builder -c "namcap PKGBUILD" || echo "::warning::namcap reported PKGBUILD issues (above)"
+            fi
             cp .SRCINFO /pkg/.SRCINFO
           '
           test -s "${WORK}/.SRCINFO" || { echo "::error::.SRCINFO was not produced"; exit 1; }
