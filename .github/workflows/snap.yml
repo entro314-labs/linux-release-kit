@@ -255,6 +255,14 @@ jobs:
           snap: ${{ steps.build.outputs.snap }}
           release: ${{ steps.rel.outputs.channel }}
 
+      - name: Report the store upload
+        if: steps.deb.outputs.found == 'true' && steps.creds.outputs.present == 'true'
+        env:
+          SNAP_FILE: ${{ steps.build.outputs.snap }}
+          CHANNEL: ${{ steps.rel.outputs.channel }}
+        run: |
+          echo "::notice::Published ${SNAP_FILE##*/} to the Snap Store '${CHANNEL}' channel"
+
       - name: Attach the snap to the release
         if: steps.deb.outputs.found == 'true' && inputs.attach_to_release
         env:

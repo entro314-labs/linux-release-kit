@@ -459,10 +459,12 @@ jobs:
           REPO: ${{ steps.rel.outputs.repo }}
           TAG: ${{ steps.rel.outputs.tag }}
           BUNDLE: ${{ steps.build.outputs.bundle }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           # --clobber so a re-run replaces the asset instead of 422-ing.
           gh release upload "$TAG" "$BUNDLE" --repo "$REPO" --clobber
+          echo "::notice::Published ${BUNDLE##*/} to ${REPO}@${TAG} — the Flathub manifest is in the flatpak-manifest-${ARCH} artifact"
 
       # The manifest is the thing you actually submit to Flathub, so keep it
       # even when nothing was attached to the release.
