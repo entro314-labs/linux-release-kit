@@ -1531,17 +1531,22 @@ jobs:
               }
               return 0;
             };
-            let makeLatest = 'true';
-            try {
-              const { data: current } = await github.rest.repos.getLatestRelease({ owner, repo });
-              const mine = parse(process.env.VERSION);
-              const theirs = parse(current.tag_name);
-              if (mine && theirs && compare(mine, theirs) < 0) {
-                makeLatest = 'false';
-                core.warning(`${process.env.VERSION} is below the current latest ${current.tag_name}; publishing without taking releases/latest`);
+            // GitHub rejects make_latest on a prerelease outright ("Latest
+            // release cannot be draft or prerelease"), so a prerelease is
+            // published with it off and never consulted for the comparison.
+            const mine = parse(process.env.VERSION);
+            let makeLatest = mine && mine[3] !== null ? 'false' : 'true';
+            if (makeLatest === 'true') {
+              try {
+                const { data: current } = await github.rest.repos.getLatestRelease({ owner, repo });
+                const theirs = parse(current.tag_name);
+                if (mine && theirs && compare(mine, theirs) < 0) {
+                  makeLatest = 'false';
+                  core.warning(`${process.env.VERSION} is below the current latest ${current.tag_name}; publishing without taking releases/latest`);
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error; // no latest yet: this one is it
               }
-            } catch (error) {
-              if (error.status !== 404) throw error; // no latest yet: this one is it
             }
             await github.rest.repos.updateRelease({
               owner, repo, release_id: Number(process.env.RELEASE_ID),
