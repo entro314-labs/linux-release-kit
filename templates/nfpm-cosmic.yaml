@@ -50,6 +50,11 @@ overrides:
 contents:
   - src: ${RK_BINARY_PATH}
     dst: /usr/bin/myapp
+    # nfpm expands ${VAR} in the top-level fields on its own, but in a
+    # contents entry only with this flag — without it the literal
+    # '${RK_BINARY_PATH}' is globbed and the build fails with
+    # "Glob failed: ${RK_BINARY_PATH}: no matching files".
+    expand: true
     file_info:
       mode: 0755
 
