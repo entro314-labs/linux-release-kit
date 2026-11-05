@@ -429,6 +429,11 @@ logic in several places, each hand-copied, none generated:
   check (`rpmkeys --dbpath`, one explicit keyring), the verify-release asset
   contract and step summary, and the checksums / SBOM / attestation jobs
 - `templates/release.yml` — the concurrency group keyed on `github.ref_name`
+- `arch-repo.yml` — the staging half (hosting-repo clone or init, pruning,
+  `repo-add` in an Arch container, database signing, the 950 MiB Pages guard,
+  the re-stage-on-rejected-push retry). The tauri kit's copy first builds its
+  packages from the released `.deb`, and refuses to overwrite a package file
+  already in the repository, since its rebuilt bytes would differ.
 
 **A fix to any of them is ported both ways, in the same change.** The
 2026-09-27 audit found F-04 (AUR pkgver ordering), F-15 (`RELEASES_TOKEN`
